@@ -8,9 +8,9 @@ class GO2CDRRoughCfg(GO2RoughCfg):
             initial_level = 0.1
             max_level = 1.0
             level_step = 0.05
-            update_interval = 20
+            update_interval = 50
             success_threshold = 0.8
-            min_episodes_for_update = 100
+            min_episodes_for_update = 500
             use_stagewise_progression = False
 
 

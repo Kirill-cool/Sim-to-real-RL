@@ -117,6 +117,8 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.seed = args.seed
         if getattr(args, "use_cvar", None) is not None:
             cfg_train.algorithm.use_cvar = _parse_optional_bool(args.use_cvar)
+        if getattr(args, "use_upesi", None) is not None:
+            cfg_train.upesi.enabled = _parse_optional_bool(args.use_upesi)
         # alg runner parameters
         if args.max_iterations is not None:
             cfg_train.runner.max_iterations = args.max_iterations
@@ -150,6 +152,16 @@ def get_args():
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--use_cvar", "type": str, "nargs": "?", "const": "true", "default": None,
          "help": "Enable/disable CVaR tail reweighting. Accepts true/false; '--use_cvar' means true."},
+        {"name": "--use_upesi", "type": str, "nargs": "?", "const": "true", "default": None,
+         "help": "Enable/disable UPESI module. Accepts true/false; '--use_upesi' means true."},
+        {"name": "--upesi_eval_mode", "type": str, "default": "standard",
+         "help": "UPESI evaluation mode for play: standard, oracle, identified."},
+        {"name": "--upesi_identification_warmup_steps", "type": int, "default": 512,
+         "help": "Number of warmup transitions for identified UPESI evaluation in play."},
+        {"name": "--upesi_identification_steps", "type": int, "default": None,
+         "help": "Override number of gradient steps in identify_alpha during play."},
+        {"name": "--upesi_identification_lr", "type": float, "default": None,
+         "help": "Override Adam LR for identify_alpha during play."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

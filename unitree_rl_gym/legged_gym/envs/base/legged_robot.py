@@ -34,6 +34,7 @@ class LeggedRobot(BaseTask):
             headless (bool): Run without rendering if True
         """
         self.cfg = cfg
+        self._upesi_theta_warn_count = 0
         self.sim_params = sim_params
         self.height_samples = None
         self.debug_viz = False
@@ -119,10 +120,16 @@ class LeggedRobot(BaseTask):
     def check_termination(self):
         """ Check if environments need to be reset
         """
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
-        self.reset_buf |= torch.logical_or(torch.abs(self.rpy[:,1])>1.0, torch.abs(self.rpy[:,0])>0.8)
+        self.termination_contact_buf = torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1
+        )
+        self.termination_orientation_buf = torch.logical_or(
+            torch.abs(self.rpy[:, 1]) > 1.0,
+            torch.abs(self.rpy[:, 0]) > 0.8,
+        )
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
-        self.reset_buf |= self.time_out_buf
+        self.termination_timeout_buf = self.time_out_buf
+        self.reset_buf = self.termination_contact_buf | self.termination_orientation_buf | self.termination_timeout_buf
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -145,6 +152,12 @@ class LeggedRobot(BaseTask):
         # Apply per-episode DR at reset so ongoing episodes are not modified mid-rollout.
         self.sample_domain_randomization(env_ids)
 
+        # Compute diagnostics before resetting episode-length counters.
+        episode_lengths = torch.clamp(self.episode_length_buf[env_ids].float(), min=1.0)
+        mean_base_height_error = torch.mean(
+            self.episode_base_height_error_sums[env_ids] / episode_lengths
+        )
+
         # reset buffers
         self.actions[env_ids] = 0.
         self.last_actions[env_ids] = 0.
@@ -160,10 +173,16 @@ class LeggedRobot(BaseTask):
             total_episode_rew += rew_term
             self.extras["episode"]['rew_' + key] = torch.mean(rew_term) / self.max_episode_length_s
             self.episode_sums[key][env_ids] = 0.
+        self.extras["episode"]["base_height_error"] = mean_base_height_error
+        self.episode_base_height_error_sums[env_ids] = 0.0
         self.extras["episode"]["reward"] = torch.mean(total_episode_rew) / self.max_episode_length_s
         success_rate = torch.mean(self.time_out_buf[env_ids].float())
         self.extras["episode"]["success_rate"] = success_rate
         self.extras["episode"]["fall_rate"] = 1.0 - success_rate
+        self.extras["episode"]["timeout_rate"] = torch.mean(self.termination_timeout_buf[env_ids].float())
+        self.extras["episode"]["contact_termination_rate"] = torch.mean(self.termination_contact_buf[env_ids].float())
+        self.extras["episode"]["orientation_termination_rate"] = torch.mean(self.termination_orientation_buf[env_ids].float())
+        self.extras["episode"]["non_timeout_termination_rate"] = 1.0 - self.extras["episode"]["timeout_rate"]
         self.extras["episode"]["num_episodes"] = float(len(env_ids))
         self.extras["episode"]["curriculum_level"] = self.get_curriculum_level()
         self.extras["episode"]["curriculum_stage"] = float(getattr(self, "cdr_stage_idx", 0))
@@ -184,6 +203,10 @@ class LeggedRobot(BaseTask):
             rew = self.reward_functions[i]() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
+        # Diagnostic only: track mean absolute base-height error per episode.
+        self.episode_base_height_error_sums += torch.abs(
+            self.root_states[:, 2] - self.cfg.rewards.base_height_target
+        )
         if self.cfg.rewards.only_positive_rewards:
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
         # add termination reward after clipping
@@ -236,17 +259,30 @@ class LeggedRobot(BaseTask):
         Returns:
             [List[gymapi.RigidShapeProperties]]: Modified rigid shape properties
         """
+        if env_id == 0:
+            self._ensure_env_theta_buffer()
+
         if self.cfg.domain_rand.randomize_friction:
-            if env_id==0:
+            if env_id == 0:
                 # prepare friction randomization
                 friction_range = self.domain_rand_current_ranges["friction_range"]
                 num_buckets = 64
                 bucket_ids = torch.randint(0, num_buckets, (self.num_envs, 1))
-                friction_buckets = torch_rand_float(friction_range[0], friction_range[1], (num_buckets,1), device='cpu')
+                friction_buckets = torch_rand_float(friction_range[0], friction_range[1], (num_buckets, 1), device='cpu')
                 self.friction_coeffs = friction_buckets[bucket_ids]
-
+            friction_value = float(self.friction_coeffs[env_id, 0].item())
             for s in range(len(props)):
-                props[s].friction = self.friction_coeffs[env_id]
+                props[s].friction = friction_value
+        else:
+            if len(props) > 0:
+                friction_value = float(props[0].friction)
+            else:
+                friction_value = float(self.domain_rand_nominal["friction"])
+            if not hasattr(self, "friction_coeffs") or self.friction_coeffs.shape[0] != self.num_envs:
+                self.friction_coeffs = torch.zeros((self.num_envs, 1), dtype=torch.float, device='cpu')
+            self.friction_coeffs[env_id, 0] = friction_value
+
+        self._set_env_theta_value(env_id, 1, friction_value)
         return props
 
     def _process_dof_props(self, props, env_id):
@@ -281,6 +317,7 @@ class LeggedRobot(BaseTask):
         if env_id == 0:
             self.base_body_masses = np.zeros(self.num_envs, dtype=np.float32)
             self.added_mass_offsets = np.zeros(self.num_envs, dtype=np.float32)
+            self._ensure_env_theta_buffer()
         self.base_body_masses[env_id] = float(props[0].mass)
 
         # if env_id==0:
@@ -297,6 +334,7 @@ class LeggedRobot(BaseTask):
             self.added_mass_offsets[env_id] = float(added_mass)
         else:
             self.added_mass_offsets[env_id] = 0.0
+        self._set_env_theta_value(env_id, 0, float(self.added_mass_offsets[env_id]))
         return props
     
     def _post_physics_step_callback(self):
@@ -480,9 +518,26 @@ class LeggedRobot(BaseTask):
         self.commands_scale = torch.tensor([self.obs_scales.lin_vel, self.obs_scales.lin_vel, self.obs_scales.ang_vel], device=self.device, requires_grad=False,) # TODO change this
         self.feet_air_time = torch.zeros(self.num_envs, self.feet_indices.shape[0], dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        self.episode_base_height_error_sums = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
+        )
+        self.termination_contact_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
+        )
+        self.termination_orientation_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
+        )
+        self.termination_timeout_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
+        )
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+        self._ensure_env_theta_buffer()
+        if hasattr(self, "added_mass_offsets"):
+            self.env_theta[:, 0] = torch.from_numpy(self.added_mass_offsets).to(device=self.device, dtype=torch.float)
+        if hasattr(self, "friction_coeffs"):
+            self.env_theta[:, 1] = self.friction_coeffs.view(-1).to(device=self.device, dtype=torch.float)
       
 
         # joint positions offsets and PD gains
@@ -725,6 +780,37 @@ class LeggedRobot(BaseTask):
         self.cfg.domain_rand.max_push_vel_xy = max(abs(push_low), abs(push_high))
         return self.domain_rand_current_ranges
 
+    def _ensure_env_theta_buffer(self):
+        if hasattr(self, "env_theta") and self.env_theta.shape[0] == self.num_envs:
+            return
+        self.env_theta = torch.zeros((self.num_envs, 2), dtype=torch.float, device=self.device)
+
+    def _set_env_theta_value(self, env_id, column_idx, value):
+        self._ensure_env_theta_buffer()
+        self.env_theta[int(env_id), int(column_idx)] = float(value)
+
+    def get_current_upesi_theta(self) -> torch.Tensor:
+        self._ensure_env_theta_buffer()
+        return self.env_theta
+
+    def get_current_upesi_theta_norm(self, theta_min, theta_max, eps=1e-6) -> torch.Tensor:
+        theta = self.get_current_upesi_theta()
+        theta_min_t = torch.as_tensor(theta_min, device=theta.device, dtype=theta.dtype).view(1, -1)
+        theta_max_t = torch.as_tensor(theta_max, device=theta.device, dtype=theta.dtype).view(1, -1)
+        denom = theta_max_t - theta_min_t
+        theta_norm = 2.0 * (theta - theta_min_t) / (denom + eps) - 1.0
+
+        below = theta < (theta_min_t - eps)
+        above = theta > (theta_max_t + eps)
+        if bool(torch.any(below | above).item()) and self._upesi_theta_warn_count < 20:
+            self._upesi_theta_warn_count += 1
+            out_count = int((below | above).sum().item())
+            print(
+                f"[UPESI] Warning: {out_count} theta entries out of global bounds "
+                f"(warning {self._upesi_theta_warn_count}/20)."
+            )
+        return theta_norm
+
     def sample_domain_randomization(self, env_ids=None):
         if env_ids is None:
             env_ids_np = np.arange(self.num_envs, dtype=np.int32)
@@ -736,29 +822,43 @@ class LeggedRobot(BaseTask):
         if env_ids_np.size == 0:
             return
 
+        self._ensure_env_theta_buffer()
+        if not hasattr(self, "friction_coeffs") or self.friction_coeffs.shape[0] != self.num_envs:
+            self.friction_coeffs = torch.zeros((self.num_envs, 1), dtype=torch.float, device='cpu')
+
         if self.cfg.domain_rand.randomize_friction:
             friction_low, friction_high = self.domain_rand_current_ranges["friction_range"]
             sampled_friction = np.random.uniform(friction_low, friction_high, size=env_ids_np.size).astype(np.float32)
-            if not hasattr(self, "friction_coeffs") or self.friction_coeffs.shape[0] != self.num_envs:
-                self.friction_coeffs = torch.zeros((self.num_envs, 1), dtype=torch.float, device='cpu')
+        else:
+            env_ids_torch = torch.as_tensor(env_ids_np, dtype=torch.long, device='cpu')
+            sampled_friction = self.friction_coeffs[env_ids_torch, 0].detach().cpu().numpy().astype(np.float32)
 
-            for env_id, friction in zip(env_ids_np, sampled_friction):
-                env_index = int(env_id)
-                self.friction_coeffs[env_index, 0] = float(friction)
+        for env_id, friction in zip(env_ids_np, sampled_friction):
+            env_index = int(env_id)
+            friction_value = float(friction)
+            self.friction_coeffs[env_index, 0] = friction_value
+            self.env_theta[env_index, 1] = friction_value
+            if self.cfg.domain_rand.randomize_friction:
                 shape_props = self.gym.get_actor_rigid_shape_properties(self.envs[env_index], self.actor_handles[env_index])
                 for prop in shape_props:
-                    prop.friction = float(friction)
+                    prop.friction = friction_value
                 self.gym.set_actor_rigid_shape_properties(self.envs[env_index], self.actor_handles[env_index], shape_props)
 
-        if self.cfg.domain_rand.randomize_base_mass and hasattr(self, "base_body_masses"):
-            mass_low, mass_high = self.domain_rand_current_ranges["added_mass_range"]
-            sampled_added_mass = np.random.uniform(mass_low, mass_high, size=env_ids_np.size).astype(np.float32)
+        if hasattr(self, "base_body_masses"):
+            if self.cfg.domain_rand.randomize_base_mass:
+                mass_low, mass_high = self.domain_rand_current_ranges["added_mass_range"]
+                sampled_added_mass = np.random.uniform(mass_low, mass_high, size=env_ids_np.size).astype(np.float32)
+            else:
+                sampled_added_mass = np.zeros(env_ids_np.size, dtype=np.float32)
             for env_id, added_mass in zip(env_ids_np, sampled_added_mass):
                 env_index = int(env_id)
-                self.added_mass_offsets[env_index] = float(added_mass)
-                body_props = self.gym.get_actor_rigid_body_properties(self.envs[env_index], self.actor_handles[env_index])
-                body_props[0].mass = float(self.base_body_masses[env_index] + added_mass)
-                self.gym.set_actor_rigid_body_properties(self.envs[env_index], self.actor_handles[env_index], body_props, recomputeInertia=True)
+                added_mass_value = float(added_mass)
+                self.added_mass_offsets[env_index] = added_mass_value
+                self.env_theta[env_index, 0] = added_mass_value
+                if self.cfg.domain_rand.randomize_base_mass:
+                    body_props = self.gym.get_actor_rigid_body_properties(self.envs[env_index], self.actor_handles[env_index])
+                    body_props[0].mass = float(self.base_body_masses[env_index] + added_mass_value)
+                    self.gym.set_actor_rigid_body_properties(self.envs[env_index], self.actor_handles[env_index], body_props, recomputeInertia=True)
 
     def _metric_to_float(self, value):
         if value is None:

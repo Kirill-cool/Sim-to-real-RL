@@ -50,7 +50,7 @@ class GO2RoughCfg( LeggedRobotCfg ):
         added_mass_nominal = 0.0
         added_mass_max_range = [-2., 2.]
 
-        push_robots = True
+        push_robots = False
         push_interval_s = 15
         max_push_vel_xy = 1.
         push_vel_xy_nominal = 0.0
@@ -68,7 +68,7 @@ class GO2RoughCfg( LeggedRobotCfg ):
   
     class rewards( LeggedRobotCfg.rewards ):
         soft_dof_pos_limit = 0.9
-        base_height_target = 0.25
+        base_height_target = 0.33
         class scales( LeggedRobotCfg.rewards.scales ):
             torques = -0.0002
             dof_pos_limits = -10.0
@@ -76,6 +76,12 @@ class GO2RoughCfg( LeggedRobotCfg ):
 class GO2RoughCfgPPO( LeggedRobotCfgPPO ):
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         entropy_coef = 0.01
+    class upesi(LeggedRobotCfgPPO.upesi):
+        # Global UPESI normalization bounds (must not change with CDR level).
+        # Covers both fixed DR ranges and final CDR target ranges.
+        theta_min = [-2.0, 0.5]   # [added_mass_min, friction_coeff_min]
+        theta_max = [2.0, 1.25]   # [added_mass_max, friction_coeff_max]
+        freeze_encoder_after_iter = 1500
     class runner( LeggedRobotCfgPPO.runner ):
         run_name = ''
         experiment_name = 'rough_go2'

@@ -109,7 +109,7 @@ class LeggedRobotCfg(BaseConfig):
             torques = -0.00001
             dof_vel = -0.
             dof_acc = -2.5e-7
-            base_height = -0. 
+            base_height = -0.1
             feet_air_time =  1.0
             collision = -1.
             feet_stumble = -0.0 
@@ -208,7 +208,7 @@ class LeggedRobotCfgPPO(BaseConfig):
         policy_class_name = 'ActorCritic'
         algorithm_class_name = 'PPO'
         num_steps_per_env = 24 # per iteration
-        max_iterations = 5000 # number of policy updates
+        max_iterations = 3000 # number of policy updates
 
         # logging
         save_interval = 50 # check for potential saves every this many iterations
@@ -219,3 +219,26 @@ class LeggedRobotCfgPPO(BaseConfig):
         load_run = -1 # -1 = last run
         checkpoint = -1 # -1 = last saved model
         resume_path = None # updated from load_run and chkpt
+
+    class upesi:
+        enabled = False
+        embedding_dim = 8
+        theta_dim = 2
+        theta_keys = ["added_mass", "friction_coeff"]
+        # Global normalization bounds that should cover both nominal DR and full CDR target ranges.
+        theta_min = [-3.0, 0.1]
+        theta_max = [3.0, 1.5]
+        dynamics_lr = 1.0e-3
+        dynamics_batch_size = 2048
+        dynamics_updates_per_iter = 4
+        lambda_rec = 0.1
+        buffer_size = 200000
+        predict_delta_obs = True
+        # If true, include base linear velocity in dynamics-loss observation subset.
+        dynamics_include_base_lin_vel = True
+        detach_encoder_for_ppo = True
+        identification_lr = 1.0e-3
+        identification_steps = 0
+        # Freeze UPESI encoder after this PPO iteration (global iteration index).
+        # -1 disables freezing.
+        freeze_encoder_after_iter = -1

@@ -155,7 +155,7 @@ def get_args():
         {"name": "--use_upesi", "type": str, "nargs": "?", "const": "true", "default": None,
          "help": "Enable/disable UPESI module. Accepts true/false; '--use_upesi' means true."},
         {"name": "--upesi_eval_mode", "type": str, "default": "standard",
-         "help": "UPESI evaluation mode for play: standard, oracle, identified."},
+         "help": "UPESI evaluation mode for play: standard, oracle, identified, online_identified."},
         {"name": "--upesi_identification_warmup_steps", "type": int, "default": 512,
          "help": "Number of warmup transitions for identified UPESI evaluation in play."},
         {"name": "--upesi_identification_steps", "type": int, "default": None,

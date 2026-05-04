@@ -109,7 +109,7 @@ class LeggedRobotCfg(BaseConfig):
             torques = -0.00001
             dof_vel = -0.
             dof_acc = -2.5e-7
-            base_height = -0.1
+            base_height = -0.
             feet_air_time =  1.0
             collision = -1.
             feet_stumble = -0.0 
@@ -222,7 +222,7 @@ class LeggedRobotCfgPPO(BaseConfig):
 
     class upesi:
         enabled = False
-        embedding_dim = 8
+        embedding_dim = 4
         theta_dim = 2
         theta_keys = ["added_mass", "friction_coeff"]
         # Global normalization bounds that should cover both nominal DR and full CDR target ranges.
@@ -237,8 +237,17 @@ class LeggedRobotCfgPPO(BaseConfig):
         # If true, include base linear velocity in dynamics-loss observation subset.
         dynamics_include_base_lin_vel = True
         detach_encoder_for_ppo = True
-        identification_lr = 1.0e-3
-        identification_steps = 0
+        identification_lr = 3.0e-3
+        identification_steps = 200
         # Freeze UPESI encoder after this PPO iteration (global iteration index).
         # -1 disables freezing.
         freeze_encoder_after_iter = -1
+        # Online identified adaptation (play/eval)
+        online_window_size = 1024
+        # Minimum number of valid transitions required to run online identification.
+        # If None or <=0 in code, defaults to online_window_size.
+        online_min_buffer_size = 256
+        online_update_interval = 128
+        online_alpha_init = "nominal"  # "zero" | "nominal"
+        online_alpha_smoothing_beta = 0.3
+        online_max_alpha_norm = 10.0

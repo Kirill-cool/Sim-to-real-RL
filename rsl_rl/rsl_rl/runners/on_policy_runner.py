@@ -346,7 +346,14 @@ class OnPolicyRunner:
             next_obs_hat = model_out
         return self._compute_upesi_dyn_loss(next_obs_hat, next_obs)
 
-    def identify_alpha(self, transitions, identification_steps=None, identification_lr=None, return_diagnostics=False):
+    def identify_alpha(
+        self,
+        transitions,
+        identification_steps=None,
+        identification_lr=None,
+        return_diagnostics=False,
+        init_alpha=None,
+    ):
         if not self.upesi_enabled:
             raise ValueError("identify_alpha is only available when UPESI is enabled.")
 
@@ -392,12 +399,20 @@ class OnPolicyRunner:
                 param_requires_grad.append(param.requires_grad)
                 param.requires_grad_(False)
 
-        alpha_param = torch.zeros(
-            (self.upesi_embedding_dim,),
-            dtype=torch.float,
-            device=self.device,
-            requires_grad=True,
-        )
+        if init_alpha is None:
+            alpha_init = torch.zeros((self.upesi_embedding_dim,), dtype=torch.float, device=self.device)
+        else:
+            alpha_init_tensor = torch.as_tensor(init_alpha, dtype=torch.float, device=self.device)
+            if alpha_init_tensor.ndim == 2 and alpha_init_tensor.shape[-1] == self.upesi_embedding_dim:
+                alpha_init = alpha_init_tensor.mean(dim=0)
+            elif alpha_init_tensor.ndim == 1 and alpha_init_tensor.shape[0] == self.upesi_embedding_dim:
+                alpha_init = alpha_init_tensor
+            else:
+                raise ValueError(
+                    "init_alpha must be shape [embedding_dim] or [N, embedding_dim]"
+                )
+
+        alpha_param = alpha_init.detach().clone().requires_grad_(True)
         optimizer = torch.optim.Adam([alpha_param], lr=lr)
         with torch.no_grad():
             loss_before = float(self._compute_identification_loss(obs, actions, next_obs, alpha_param.detach()).item())
@@ -469,6 +484,7 @@ class OnPolicyRunner:
         identification_steps=None,
         identification_lr=None,
         return_diagnostics=False,
+        init_alpha=None,
     ):
         if not self.upesi_enabled:
             raise ValueError("Identified UPESI evaluation requires upesi.enabled = true.")
@@ -477,6 +493,7 @@ class OnPolicyRunner:
             identification_steps=identification_steps,
             identification_lr=identification_lr,
             return_diagnostics=return_diagnostics,
+            init_alpha=init_alpha,
         )
         if return_diagnostics:
             alpha_star, identify_diagnostics = identify_result
@@ -890,13 +907,8 @@ class OnPolicyRunner:
         if upesi_scale_stats is not None and self.upesi_enabled:
             ep_string += f"""{'UPESI obs_mean:':>{pad}} {upesi_scale_stats['obs_mean']:.6f}\n"""
             ep_string += f"""{'UPESI obs_std:':>{pad}} {upesi_scale_stats['obs_std']:.6f}\n"""
-            ep_string += f"""{'UPESI obs_min:':>{pad}} {upesi_scale_stats['obs_min']:.6f}\n"""
-            ep_string += f"""{'UPESI obs_max:':>{pad}} {upesi_scale_stats['obs_max']:.6f}\n"""
             ep_string += f"""{'UPESI alpha_mean:':>{pad}} {upesi_scale_stats['alpha_mean']:.6f}\n"""
             ep_string += f"""{'UPESI alpha_std:':>{pad}} {upesi_scale_stats['alpha_std']:.6f}\n"""
-            ep_string += f"""{'UPESI alpha_min:':>{pad}} {upesi_scale_stats['alpha_min']:.6f}\n"""
-            ep_string += f"""{'UPESI alpha_max:':>{pad}} {upesi_scale_stats['alpha_max']:.6f}\n"""
-            ep_string += f"""{'UPESI alpha_norm:':>{pad}} {upesi_scale_stats['alpha_norm']:.6f}\n"""
 
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))

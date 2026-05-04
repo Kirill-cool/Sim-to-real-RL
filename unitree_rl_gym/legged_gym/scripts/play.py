@@ -211,10 +211,11 @@ def play(args):
     env_cfg.domain_rand.randomize_friction = env_cfg.domain_rand.randomize_friction
     env_cfg.domain_rand.push_robots = env_cfg.domain_rand.push_robots
     env_cfg.commands.curriculum = env_cfg.commands.curriculum
-    env_cfg.commands.ranges.lin_vel_x = [1.0, 1.0]
+    env_cfg.commands.ranges.lin_vel_x = [0.3, 0.5]
     env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
     env_cfg.commands.ranges.ang_vel_yaw = [0.0, 0.0]
 
+    env_cfg.commands.heading_command = False
     env_cfg.env.test = True
 
     # prepare environment
@@ -225,8 +226,11 @@ def play(args):
     # OnPolicyRunner.__init__ performs env.reset(); re-fetch observations to avoid stale pre-reset tensors.
     obs = env.get_observations()
     upesi_eval_mode = str(getattr(args, "upesi_eval_mode", "standard")).strip().lower()
-    if upesi_eval_mode not in {"standard", "oracle", "identified"}:
-        raise ValueError(f"Unknown upesi_eval_mode='{upesi_eval_mode}'. Use one of: standard, oracle, identified.")
+    if upesi_eval_mode not in {"standard", "oracle", "identified", "online_identified"}:
+        raise ValueError(
+            f"Unknown upesi_eval_mode='{upesi_eval_mode}'. "
+            "Use one of: standard, oracle, identified, online_identified."
+        )
 
     # Episode timeouts trigger at episode_length > max_episode_length in the env,
     # so we run one extra step to ensure timeout-completed episodes enter metrics.
@@ -261,7 +265,7 @@ def play(args):
                 "oracle_tracking_error": oracle_eval["tracking_error"],
             },
         )
-    else:
+    elif upesi_eval_mode == "identified":
         if not bool(getattr(ppo_runner, "upesi_enabled", False)):
             raise ValueError("identified UPESI eval requires upesi.enabled = true")
         warmup_steps = max(1, int(getattr(args, "upesi_identification_warmup_steps", 512)))
@@ -349,6 +353,205 @@ def play(args):
                 "oracle_other_non_timeout_rate": oracle_eval["other_non_timeout_rate"],
                 "oracle_tracking_error": oracle_eval["tracking_error"],
                 "return_diff": return_diff,
+            },
+        )
+    else:
+        if not bool(getattr(ppo_runner, "upesi_enabled", False)):
+            raise ValueError("online_identified UPESI eval requires upesi.enabled = true")
+
+        upesi_cfg = getattr(ppo_runner, "upesi_cfg", {})
+        online_window_size = max(1, int(upesi_cfg.get("online_window_size", 512)))
+        online_min_buffer_size_cfg = upesi_cfg.get("online_min_buffer_size", None)
+        if online_min_buffer_size_cfg is None:
+            online_min_buffer_size = online_window_size
+        else:
+            online_min_buffer_size = int(online_min_buffer_size_cfg)
+            if online_min_buffer_size <= 0:
+                online_min_buffer_size = online_window_size
+        online_update_interval = max(1, int(upesi_cfg.get("online_update_interval", 64)))
+        online_alpha_init = str(upesi_cfg.get("online_alpha_init", "zero")).strip().lower()
+        if online_alpha_init not in {"zero", "nominal"}:
+            raise ValueError("upesi.online_alpha_init must be 'zero' or 'nominal'")
+        online_alpha_smoothing_beta = float(upesi_cfg.get("online_alpha_smoothing_beta", 0.2))
+        online_alpha_smoothing_beta = float(np.clip(online_alpha_smoothing_beta, 0.0, 1.0))
+        online_max_alpha_norm = float(upesi_cfg.get("online_max_alpha_norm", 10.0))
+        online_identify_accept_ratio = 0.999
+        identification_steps = getattr(args, "upesi_identification_steps", None)
+        identification_lr = getattr(args, "upesi_identification_lr", None)
+
+        ppo_runner.alg.actor_critic.eval()
+        if online_alpha_init == "nominal":
+            with torch.inference_mode():
+                theta_zero_norm = torch.zeros(
+                    (1, ppo_runner.upesi_theta_dim),
+                    dtype=torch.float,
+                    device=env.device,
+                )
+                alpha_current = ppo_runner.upesi_encoder(theta_zero_norm).view(-1).detach().clone()
+        else:
+            alpha_current = torch.zeros(
+                (ppo_runner.upesi_embedding_dim,),
+                dtype=torch.float,
+                device=env.device,
+            )
+
+        trans_obs_buf = None
+        trans_action_buf = None
+        trans_next_obs_buf = None
+        online_ep_infos = []
+        online_cur_reward_sum = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+        online_cur_episode_length = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+        online_finished_returns = []
+        online_finished_lengths = []
+
+        for step_idx in range(1, eval_steps + 1):
+            with torch.inference_mode():
+                alpha_batch = alpha_current.view(1, -1).expand(obs.shape[0], -1)
+                obs_for_policy = torch.cat((obs.detach(), alpha_batch), dim=-1)
+                actions = ppo_runner.alg.actor_critic.act_inference(obs_for_policy)
+                next_obs, _, rews, dones, infos = env.step(actions.detach())
+
+            dones_mask = dones.to(env.device).view(-1).bool()
+            valid_mask = torch.logical_not(dones_mask)
+            if bool(torch.any(valid_mask).item()):
+                obs_valid = obs.detach()[valid_mask].clone()
+                actions_valid = actions.detach()[valid_mask].clone()
+                next_obs_valid = next_obs.detach()[valid_mask].clone()
+                if trans_obs_buf is None:
+                    trans_obs_buf = obs_valid
+                    trans_action_buf = actions_valid
+                    trans_next_obs_buf = next_obs_valid
+                    if trans_obs_buf.shape[0] > online_window_size:
+                        trans_obs_buf = trans_obs_buf[-online_window_size:]
+                        trans_action_buf = trans_action_buf[-online_window_size:]
+                        trans_next_obs_buf = trans_next_obs_buf[-online_window_size:]
+                else:
+                    trans_obs_buf = torch.cat((trans_obs_buf, obs_valid), dim=0)
+                    trans_action_buf = torch.cat((trans_action_buf, actions_valid), dim=0)
+                    trans_next_obs_buf = torch.cat((trans_next_obs_buf, next_obs_valid), dim=0)
+                    if trans_obs_buf.shape[0] > online_window_size:
+                        trans_obs_buf = trans_obs_buf[-online_window_size:]
+                        trans_action_buf = trans_action_buf[-online_window_size:]
+                        trans_next_obs_buf = trans_next_obs_buf[-online_window_size:]
+
+            rews = rews.to(env.device)
+            online_cur_reward_sum += rews
+            online_cur_episode_length += 1
+            if isinstance(infos, dict) and "episode" in infos:
+                online_ep_infos.append(infos["episode"])
+            online_done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
+            if online_done_ids.numel() > 0:
+                online_finished_returns.extend(
+                    online_cur_reward_sum[online_done_ids].detach().cpu().numpy().tolist()
+                )
+                online_finished_lengths.extend(
+                    online_cur_episode_length[online_done_ids].detach().cpu().numpy().tolist()
+                )
+                online_cur_reward_sum[online_done_ids] = 0
+                online_cur_episode_length[online_done_ids] = 0
+            obs = next_obs
+
+            if step_idx % online_update_interval != 0:
+                continue
+
+            online_buffer_size = 0 if trans_obs_buf is None else int(trans_obs_buf.shape[0])
+            if online_buffer_size < online_min_buffer_size:
+                _print_upesi_eval_block(
+                    "online_identified",
+                    {
+                        "online_step": float(step_idx),
+                        "online_update_status": "skipped",
+                        "online_skip_reason": "insufficient_buffer",
+                        "online_buffer_size/current_min_size": f"{online_buffer_size}/{online_min_buffer_size}",
+                        "online_alpha_norm": float(alpha_current.norm().item()),
+                    },
+                )
+                continue
+
+            transitions = {
+                "obs": trans_obs_buf,
+                "action": trans_action_buf,
+                "next_obs": trans_next_obs_buf,
+            }
+            alpha_new, identify_diag = ppo_runner.identify_alpha(
+                transitions=transitions,
+                identification_steps=identification_steps,
+                identification_lr=identification_lr,
+                return_diagnostics=True,
+                init_alpha=alpha_current,
+            )
+
+            identify_loss_before = identify_diag["identify_loss_before"]
+            identify_loss_after = identify_diag["identify_loss_after"]
+            identify_loss_ratio = identify_diag["identify_loss_ratio"]
+            alpha_new_norm = float(alpha_new.norm().item())
+
+            accept_update = True
+            if identify_loss_ratio >= online_identify_accept_ratio:
+                accept_update = False
+            if alpha_new_norm > online_max_alpha_norm:
+                accept_update = False
+
+            if accept_update:
+                alpha_current = (
+                    (1.0 - online_alpha_smoothing_beta) * alpha_current
+                    + online_alpha_smoothing_beta * alpha_new
+                )
+                online_update_status = "accepted"
+            else:
+                online_update_status = "rejected"
+
+            online_alpha_norm = float(alpha_current.norm().item())
+            online_alpha_oracle_dist = None
+            try:
+                with torch.inference_mode():
+                    alpha_oracle = ppo_runner.get_oracle_alpha(device=env.device)
+                    alpha_oracle_mean = alpha_oracle.mean(dim=0)
+                    online_alpha_oracle_dist = float(
+                        torch.norm(alpha_current - alpha_oracle_mean, p=2).item()
+                    )
+            except Exception:
+                online_alpha_oracle_dist = None
+
+            _print_upesi_eval_block(
+                "online_identified",
+                {
+                    "online_step": float(step_idx),
+                    "online_update_status": online_update_status,
+                    "online_alpha_norm": online_alpha_norm,
+                    "online_identify_loss_before": identify_loss_before,
+                    "online_identify_loss_after": identify_loss_after,
+                    "online_identify_loss_ratio": identify_loss_ratio,
+                    "online_buffer_size/current_min_size": f"{online_buffer_size}/{online_min_buffer_size}",
+                    "online_alpha_oracle_dist": online_alpha_oracle_dist,
+                },
+            )
+
+        online_episode_metrics = _aggregate_episode_metrics(online_ep_infos)
+        final_online_alpha_oracle_dist = None
+        try:
+            with torch.inference_mode():
+                alpha_oracle = ppo_runner.get_oracle_alpha(device=env.device)
+                alpha_oracle_mean = alpha_oracle.mean(dim=0)
+                final_online_alpha_oracle_dist = float(
+                    torch.norm(alpha_current - alpha_oracle_mean, p=2).item()
+                )
+        except Exception:
+            final_online_alpha_oracle_dist = None
+
+        _print_upesi_eval_block(
+            "online_identified_summary",
+            {
+                "online_return": float(np.mean(online_finished_returns)) if len(online_finished_returns) > 0 else None,
+                "online_episode_length": float(np.mean(online_finished_lengths)) if len(online_finished_lengths) > 0 else None,
+                "online_fall_rate": online_episode_metrics["fall_rate"],
+                "online_timeout_rate": online_episode_metrics["timeout_rate"],
+                "online_contact_termination_rate": online_episode_metrics["contact_termination_rate"],
+                "online_orientation_termination_rate": online_episode_metrics["orientation_termination_rate"],
+                "online_non_timeout_termination_rate": online_episode_metrics["non_timeout_termination_rate"],
+                "online_tracking_error": online_episode_metrics["tracking_error"],
+                "online_final_alpha_norm": float(alpha_current.norm().item()),
+                "online_final_alpha_oracle_dist": final_online_alpha_oracle_dist,
             },
         )
     

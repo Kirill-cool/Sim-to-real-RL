@@ -203,8 +203,9 @@ class LeggedRobot(BaseTask):
             rew = self.reward_functions[i]() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
-        # Diagnostic only: track mean absolute base-height error per episode.
-        self.episode_base_height_error_sums += torch.abs(
+        # Diagnostic only: track mean signed base-height deviation per episode.
+        # Positive => base is above target, negative => base is below target.
+        self.episode_base_height_error_sums += (
             self.root_states[:, 2] - self.cfg.rewards.base_height_target
         )
         if self.cfg.rewards.only_positive_rewards:

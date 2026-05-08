@@ -109,7 +109,7 @@ class LeggedRobotCfg(BaseConfig):
             torques = -0.00001
             dof_vel = -0.
             dof_acc = -2.5e-7
-            base_height = -0.
+            base_height = -0.3
             feet_air_time =  1.0
             collision = -1.
             feet_stumble = -0.0 
@@ -199,9 +199,9 @@ class LeggedRobotCfgPPO(BaseConfig):
         max_grad_norm = 1.
         # Optional CVaR-PPO (tail reweighting over episodic returns from rollout)
         use_cvar = False
-        cvar_alpha = 0.1
-        cvar_tail_weight = 3.0
-        cvar_min_completed_episodes = 16
+        cvar_alpha = 0.05
+        cvar_tail_weight = 1.2
+        cvar_min_completed_episodes = 85
         cvar_use_base_dr_only = True
 
     class runner:
@@ -237,8 +237,11 @@ class LeggedRobotCfgPPO(BaseConfig):
         # If true, include base linear velocity in dynamics-loss observation subset.
         dynamics_include_base_lin_vel = True
         detach_encoder_for_ppo = True
-        identification_lr = 3.0e-3
+        identification_lr = 1.0e-3
         identification_steps = 200
+        # Optional episode length override (seconds) used only in play.py for upesi_eval_mode="identified".
+        # None or <=0 keeps the default env episode length.
+        identified_eval_episode_length_s = 5.0
         # Freeze UPESI encoder after this PPO iteration (global iteration index).
         # -1 disables freezing.
         freeze_encoder_after_iter = -1
@@ -248,6 +251,17 @@ class LeggedRobotCfgPPO(BaseConfig):
         # If None or <=0 in code, defaults to online_window_size.
         online_min_buffer_size = 256
         online_update_interval = 128
-        online_alpha_init = "nominal"  # "zero" | "nominal"
+        online_alpha_init = "nominal"  # "zero" | "nominal" | "file"
+        # Path to serialized alpha for online_alpha_init="file" and/or saving final alpha.
+        online_alpha_file = ""
+        # If false, run fixed-alpha playback in online_identified mode (no online adaptation updates).
+        online_enable_updates = True
         online_alpha_smoothing_beta = 0.3
         online_max_alpha_norm = 10.0
+        # Accept online alpha update only if identify_loss_ratio < this threshold.
+        online_identify_accept_ratio = 0.995
+        # Multiplier for play.py rollout length in online_identified mode only.
+        # 1.0 keeps default length: int(env.max_episode_length) + 1.
+        online_eval_rollout_multiplier = 1.0
+        # If true, save final alpha after online_identified run.
+        online_save_final_alpha = False

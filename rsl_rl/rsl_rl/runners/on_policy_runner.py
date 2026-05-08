@@ -212,6 +212,8 @@ class OnPolicyRunner:
                 "CVaR is configured with cvar_use_base_dr_only=True, but CDR is enabled in the environment. "
                 "Use a base-DR task (without CDR) for CVaR experiments or disable this guard explicitly."
             )
+        self._validate_upesi_theta_bounds_against_cdr()
+        self._log_startup_summary()
         self.last_cvar_stats = getattr(self.alg, "last_cvar_stats", None)
         self.current_episode_ids = torch.arange(self.env.num_envs, device=self.device, dtype=torch.long)
         self.next_episode_id = int(self.env.num_envs)
@@ -297,6 +299,95 @@ class OnPolicyRunner:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _to_range_pair(self, value, fallback):
+        if value is None:
+            value = fallback
+        if isinstance(value, (list, tuple)):
+            if len(value) >= 2:
+                low, high = float(value[0]), float(value[1])
+            elif len(value) == 1:
+                low = high = float(value[0])
+            else:
+                low, high = float(fallback[0]), float(fallback[1])
+        else:
+            low = high = float(value)
+        if low > high:
+            low, high = high, low
+        return [low, high]
+
+    def _get_cdr_max_ranges(self):
+        max_ranges = getattr(self.env, "domain_rand_max_ranges", None)
+        if isinstance(max_ranges, dict):
+            friction_range = self._to_range_pair(max_ranges.get("friction_range"), [1.0, 1.0])
+            added_mass_range = self._to_range_pair(max_ranges.get("added_mass_range"), [0.0, 0.0])
+            return friction_range, added_mass_range
+
+        cfg_dr = getattr(getattr(self.env, "cfg", None), "domain_rand", None)
+        friction_range = self._to_range_pair(
+            getattr(cfg_dr, "friction_max_range", getattr(cfg_dr, "friction_range", [1.0, 1.0])),
+            [1.0, 1.0],
+        )
+        added_mass_range = self._to_range_pair(
+            getattr(cfg_dr, "added_mass_max_range", getattr(cfg_dr, "added_mass_range", [0.0, 0.0])),
+            [0.0, 0.0],
+        )
+        return friction_range, added_mass_range
+
+    def _validate_upesi_theta_bounds_against_cdr(self):
+        if not self.upesi_enabled:
+            return
+        if not bool(getattr(self.env, "cdr_enabled", False)):
+            return
+
+        friction_range, added_mass_range = self._get_cdr_max_ranges()
+        theta_min = self.upesi_theta_min.view(-1)
+        theta_max = self.upesi_theta_max.view(-1)
+
+        theta_added_min = float(theta_min[0].item())
+        theta_added_max = float(theta_max[0].item())
+        theta_friction_min = float(theta_min[1].item())
+        theta_friction_max = float(theta_max[1].item())
+
+        covers_added_mass = theta_added_min <= added_mass_range[0] and theta_added_max >= added_mass_range[1]
+        covers_friction = theta_friction_min <= friction_range[0] and theta_friction_max >= friction_range[1]
+        if covers_added_mass and covers_friction:
+            return
+
+        raise ValueError(
+            "[UPESI/CDR] Invalid theta bounds: upesi.theta_min/theta_max must cover CDR max ranges.\n"
+            f"  theta keys: {self.upesi_theta_keys}\n"
+            f"  upesi.theta bounds: added_mass[{theta_added_min}, {theta_added_max}], "
+            f"friction[{theta_friction_min}, {theta_friction_max}]\n"
+            f"  CDR max ranges: added_mass[{added_mass_range[0]}, {added_mass_range[1]}], "
+            f"friction[{friction_range[0]}, {friction_range[1]}]"
+        )
+
+    def _log_startup_summary(self):
+        cdr_enabled = bool(getattr(self.env, "cdr_enabled", False))
+        friction_range, added_mass_range = self._get_cdr_max_ranges()
+        if self.upesi_enabled:
+            theta_keys_str = ",".join(self.upesi_theta_keys)
+            theta_bounds_str = (
+                f"[{float(self.upesi_theta_min.view(-1)[0].item()):.4f}, {float(self.upesi_theta_max.view(-1)[0].item()):.4f}] / "
+                f"[{float(self.upesi_theta_min.view(-1)[1].item()):.4f}, {float(self.upesi_theta_max.view(-1)[1].item()):.4f}]"
+            )
+        else:
+            theta_keys_str = "n/a"
+            theta_bounds_str = "n/a"
+
+        print(
+            "[Startup] "
+            f"CDR enabled={int(cdr_enabled)} | "
+            f"CVaR enabled={int(self.use_cvar)} alpha={float(getattr(self.alg, 'cvar_alpha', 0.0)):.4f} "
+            f"tail_weight={float(getattr(self.alg, 'cvar_tail_weight', 1.0)):.4f} "
+            f"base_dr_only={int(self.cvar_use_base_dr_only)} | "
+            f"UPESI enabled={int(self.upesi_enabled)} "
+            f"theta_keys={theta_keys_str} "
+            f"theta_bounds(added_mass/friction)={theta_bounds_str} | "
+            f"CDR max added_mass=[{added_mass_range[0]:.4f}, {added_mass_range[1]:.4f}] "
+            f"friction=[{friction_range[0]:.4f}, {friction_range[1]:.4f}]"
+        )
 
     def _get_upesi_theta_norm(self):
         if hasattr(self.env, "get_current_upesi_theta_norm"):

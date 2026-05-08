@@ -10,6 +10,7 @@ from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Log
 
 import numpy as np
 import torch
+import json
 
 
 def _to_float(value):
@@ -23,6 +24,19 @@ def _to_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value from '{value}'")
 
 
 def _aggregate_episode_metrics(ep_infos):
@@ -72,87 +86,95 @@ def _aggregate_episode_metrics(ep_infos):
     }
 
 
-def _run_eval_rollout(env, policy, obs, num_steps):
-    ep_infos = []
-    cur_reward_sum = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
-    cur_episode_length = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
-    finished_returns = []
-    finished_lengths = []
-    done_total = 0
-    timeout_total = 0
-    contact_total = 0
-    orientation_total = 0
-    non_timeout_total = 0
-    contact_only_non_timeout_total = 0
-    orientation_only_non_timeout_total = 0
-    contact_and_orientation_non_timeout_total = 0
-    other_non_timeout_total = 0
+def _init_eval_rollout_accumulators(env):
+    return {
+        "ep_infos": [],
+        "cur_reward_sum": torch.zeros(env.num_envs, dtype=torch.float, device=env.device),
+        "cur_episode_length": torch.zeros(env.num_envs, dtype=torch.float, device=env.device),
+        "finished_returns": [],
+        "finished_lengths": [],
+        "done_total": 0,
+        "timeout_total": 0,
+        "contact_total": 0,
+        "orientation_total": 0,
+        "non_timeout_total": 0,
+        "contact_only_non_timeout_total": 0,
+        "orientation_only_non_timeout_total": 0,
+        "contact_and_orientation_non_timeout_total": 0,
+        "other_non_timeout_total": 0,
+    }
 
-    for _ in range(num_steps):
-        actions = policy(obs.detach())
-        obs, _, rews, dones, infos = env.step(actions.detach())
-        rews = rews.to(env.device)
-        dones = dones.to(env.device)
-        cur_reward_sum += rews
-        cur_episode_length += 1
-        if isinstance(infos, dict) and "episode" in infos:
-            ep_infos.append(infos["episode"])
-        done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
-        if done_ids.numel() > 0:
-            finished_returns.extend(cur_reward_sum[done_ids].detach().cpu().numpy().tolist())
-            finished_lengths.extend(cur_episode_length[done_ids].detach().cpu().numpy().tolist())
 
-            done_total += int(done_ids.numel())
-            timeout_flags = None
-            if hasattr(env, "termination_timeout_buf"):
-                timeout_flags = env.termination_timeout_buf[done_ids].bool()
-            elif isinstance(infos, dict) and "time_outs" in infos:
-                timeout_flags = infos["time_outs"][done_ids].to(env.device).bool()
-            else:
-                timeout_flags = torch.zeros(done_ids.numel(), dtype=torch.bool, device=env.device)
-            contact_flags = (
-                env.termination_contact_buf[done_ids].bool()
-                if hasattr(env, "termination_contact_buf")
-                else torch.zeros(done_ids.numel(), dtype=torch.bool, device=env.device)
-            )
-            orientation_flags = (
-                env.termination_orientation_buf[done_ids].bool()
-                if hasattr(env, "termination_orientation_buf")
-                else torch.zeros(done_ids.numel(), dtype=torch.bool, device=env.device)
-            )
+def _accumulate_eval_step(env, accum, rews, dones, infos):
+    rews = rews.to(env.device)
+    dones = dones.to(env.device)
+    accum["cur_reward_sum"] += rews
+    accum["cur_episode_length"] += 1
 
-            non_timeout_flags = torch.logical_not(timeout_flags)
-            timeout_total += int(timeout_flags.sum().item())
-            contact_total += int(contact_flags.sum().item())
-            orientation_total += int(orientation_flags.sum().item())
-            non_timeout_total += int(non_timeout_flags.sum().item())
-            contact_only_non_timeout_total += int(
-                (contact_flags & torch.logical_not(orientation_flags) & non_timeout_flags).sum().item()
-            )
-            orientation_only_non_timeout_total += int(
-                (orientation_flags & torch.logical_not(contact_flags) & non_timeout_flags).sum().item()
-            )
-            contact_and_orientation_non_timeout_total += int(
-                (contact_flags & orientation_flags & non_timeout_flags).sum().item()
-            )
-            other_non_timeout_total += int(
-                (non_timeout_flags & torch.logical_not(contact_flags) & torch.logical_not(orientation_flags)).sum().item()
-            )
+    if isinstance(infos, dict) and "episode" in infos:
+        accum["ep_infos"].append(infos["episode"])
 
-            cur_reward_sum[done_ids] = 0
-            cur_episode_length[done_ids] = 0
+    done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
+    if done_ids.numel() == 0:
+        return
 
-    episode_metrics = _aggregate_episode_metrics(ep_infos)
+    accum["finished_returns"].extend(accum["cur_reward_sum"][done_ids].detach().cpu().numpy().tolist())
+    accum["finished_lengths"].extend(accum["cur_episode_length"][done_ids].detach().cpu().numpy().tolist())
+
+    accum["done_total"] += int(done_ids.numel())
+    if hasattr(env, "termination_timeout_buf"):
+        timeout_flags = env.termination_timeout_buf[done_ids].bool()
+    elif isinstance(infos, dict) and "time_outs" in infos:
+        timeout_flags = infos["time_outs"][done_ids].to(env.device).bool()
+    else:
+        timeout_flags = torch.zeros(done_ids.numel(), dtype=torch.bool, device=env.device)
+
+    contact_flags = (
+        env.termination_contact_buf[done_ids].bool()
+        if hasattr(env, "termination_contact_buf")
+        else torch.zeros(done_ids.numel(), dtype=torch.bool, device=env.device)
+    )
+    orientation_flags = (
+        env.termination_orientation_buf[done_ids].bool()
+        if hasattr(env, "termination_orientation_buf")
+        else torch.zeros(done_ids.numel(), dtype=torch.bool, device=env.device)
+    )
+    non_timeout_flags = torch.logical_not(timeout_flags)
+
+    accum["timeout_total"] += int(timeout_flags.sum().item())
+    accum["contact_total"] += int(contact_flags.sum().item())
+    accum["orientation_total"] += int(orientation_flags.sum().item())
+    accum["non_timeout_total"] += int(non_timeout_flags.sum().item())
+    accum["contact_only_non_timeout_total"] += int(
+        (contact_flags & torch.logical_not(orientation_flags) & non_timeout_flags).sum().item()
+    )
+    accum["orientation_only_non_timeout_total"] += int(
+        (orientation_flags & torch.logical_not(contact_flags) & non_timeout_flags).sum().item()
+    )
+    accum["contact_and_orientation_non_timeout_total"] += int(
+        (contact_flags & orientation_flags & non_timeout_flags).sum().item()
+    )
+    accum["other_non_timeout_total"] += int(
+        (non_timeout_flags & torch.logical_not(contact_flags) & torch.logical_not(orientation_flags)).sum().item()
+    )
+
+    accum["cur_reward_sum"][done_ids] = 0
+    accum["cur_episode_length"][done_ids] = 0
+
+
+def _finalize_eval_rollout_metrics(accum):
+    episode_metrics = _aggregate_episode_metrics(accum["ep_infos"])
+    done_total = int(accum["done_total"])
     if done_total > 0:
-        fall_rate = non_timeout_total / done_total
-        timeout_rate = timeout_total / done_total
-        contact_termination_rate = contact_total / done_total
-        orientation_termination_rate = orientation_total / done_total
-        non_timeout_termination_rate = non_timeout_total / done_total
-        contact_only_non_timeout_rate = contact_only_non_timeout_total / done_total
-        orientation_only_non_timeout_rate = orientation_only_non_timeout_total / done_total
-        contact_and_orientation_non_timeout_rate = contact_and_orientation_non_timeout_total / done_total
-        other_non_timeout_rate = other_non_timeout_total / done_total
+        fall_rate = accum["non_timeout_total"] / done_total
+        timeout_rate = accum["timeout_total"] / done_total
+        contact_termination_rate = accum["contact_total"] / done_total
+        orientation_termination_rate = accum["orientation_total"] / done_total
+        non_timeout_termination_rate = accum["non_timeout_total"] / done_total
+        contact_only_non_timeout_rate = accum["contact_only_non_timeout_total"] / done_total
+        orientation_only_non_timeout_rate = accum["orientation_only_non_timeout_total"] / done_total
+        contact_and_orientation_non_timeout_rate = accum["contact_and_orientation_non_timeout_total"] / done_total
+        other_non_timeout_rate = accum["other_non_timeout_total"] / done_total
     else:
         fall_rate = episode_metrics["fall_rate"]
         timeout_rate = episode_metrics["timeout_rate"]
@@ -165,9 +187,8 @@ def _run_eval_rollout(env, policy, obs, num_steps):
         other_non_timeout_rate = None
 
     return {
-        "obs": obs,
-        "return": float(np.mean(finished_returns)) if len(finished_returns) > 0 else None,
-        "episode_length": float(np.mean(finished_lengths)) if len(finished_lengths) > 0 else None,
+        "return": float(np.mean(accum["finished_returns"])) if len(accum["finished_returns"]) > 0 else None,
+        "episode_length": float(np.mean(accum["finished_lengths"])) if len(accum["finished_lengths"]) > 0 else None,
         "episodes_finished": float(done_total),
         "fall_rate": fall_rate,
         "tracking_error": episode_metrics["tracking_error"],
@@ -182,10 +203,150 @@ def _run_eval_rollout(env, policy, obs, num_steps):
     }
 
 
+def _run_eval_rollout(env, policy, obs, num_steps):
+    accum = _init_eval_rollout_accumulators(env)
+
+    for _ in range(num_steps):
+        actions = policy(obs.detach())
+        obs, _, rews, dones, infos = env.step(actions.detach())
+        _accumulate_eval_step(env, accum, rews, dones, infos)
+
+    final_metrics = _finalize_eval_rollout_metrics(accum)
+
+    return {
+        "obs": obs,
+        "return": final_metrics["return"],
+        "episode_length": final_metrics["episode_length"],
+        "episodes_finished": final_metrics["episodes_finished"],
+        "fall_rate": final_metrics["fall_rate"],
+        "tracking_error": final_metrics["tracking_error"],
+        "timeout_rate": final_metrics["timeout_rate"],
+        "contact_termination_rate": final_metrics["contact_termination_rate"],
+        "orientation_termination_rate": final_metrics["orientation_termination_rate"],
+        "non_timeout_termination_rate": final_metrics["non_timeout_termination_rate"],
+        "contact_only_non_timeout_rate": final_metrics["contact_only_non_timeout_rate"],
+        "orientation_only_non_timeout_rate": final_metrics["orientation_only_non_timeout_rate"],
+        "contact_and_orientation_non_timeout_rate": final_metrics["contact_and_orientation_non_timeout_rate"],
+        "other_non_timeout_rate": final_metrics["other_non_timeout_rate"],
+    }
+
+
 def _fmt_metric(value, precision=6):
     if value is None:
         return "n/a"
     return f"{float(value):.{precision}f}"
+
+
+def _load_online_alpha_from_file(path, expected_dim, device):
+    loaded = torch.load(path, map_location=device)
+    if isinstance(loaded, dict):
+        if "alpha" in loaded:
+            alpha = loaded["alpha"]
+        elif "alpha_current" in loaded:
+            alpha = loaded["alpha_current"]
+        else:
+            raise ValueError(
+                f"online_alpha_file='{path}' does not contain 'alpha' or 'alpha_current'."
+            )
+    else:
+        alpha = loaded
+    alpha_t = torch.as_tensor(alpha, dtype=torch.float, device=device)
+    if alpha_t.ndim == 2 and alpha_t.shape[-1] == expected_dim:
+        alpha_t = alpha_t.mean(dim=0)
+    elif alpha_t.ndim == 1 and alpha_t.shape[0] == expected_dim:
+        pass
+    else:
+        raise ValueError(
+            f"Loaded alpha has shape {tuple(alpha_t.shape)}, expected [{expected_dim}] or [N, {expected_dim}]."
+        )
+    return alpha_t.detach().clone()
+
+
+def _save_online_alpha_to_file(path, alpha, metadata=None):
+    save_dir = os.path.dirname(path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    payload = {
+        "alpha": alpha.detach().cpu(),
+    }
+    if metadata is not None:
+        payload["metadata"] = metadata
+    torch.save(payload, path)
+
+
+def _resolve_combined_run_name(train_cfg, args):
+    candidates = [
+        getattr(args, "load_run", None),
+        getattr(getattr(train_cfg, "runner", None), "load_run", None),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate_str = str(candidate).strip()
+        if candidate_str in {"", "-1", "policies", "exported"}:
+            continue
+        return os.path.basename(candidate_str.rstrip("/"))
+
+    combined_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "rough_go2_combined")
+    try:
+        run_dirs = [
+            d for d in os.listdir(combined_root)
+            if os.path.isdir(os.path.join(combined_root, d))
+            and d != "exported"
+            and not d.endswith("_adapted")
+        ]
+        if len(run_dirs) == 0:
+            return "unknown_run"
+        run_dirs.sort()
+        return run_dirs[-1]
+    except Exception:
+        return "unknown_run"
+
+
+def _make_unique_dir(parent_dir, base_name):
+    os.makedirs(parent_dir, exist_ok=True)
+    candidate = os.path.join(parent_dir, base_name)
+    if not os.path.exists(candidate):
+        os.makedirs(candidate, exist_ok=True)
+        return candidate
+    idx = 2
+    while True:
+        candidate = os.path.join(parent_dir, f"{base_name}_{idx:02d}")
+        if not os.path.exists(candidate):
+            os.makedirs(candidate, exist_ok=True)
+            return candidate
+        idx += 1
+
+
+def _create_adapted_export_package(train_cfg, ppo_runner, args, alpha, summary_metrics):
+    run_name = _resolve_combined_run_name(train_cfg, args)
+    run_name_clean = run_name.rstrip("_")
+    combined_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "rough_go2_combined")
+    adapted_group_dir = os.path.join(combined_root, f"{run_name_clean}_adapted")
+    package_dir = _make_unique_dir(adapted_group_dir, f"{run_name_clean}_adapted_model")
+
+    alpha_path = os.path.join(package_dir, "online_alpha.pt")
+    _save_online_alpha_to_file(
+        alpha_path,
+        alpha=alpha,
+        metadata=summary_metrics,
+    )
+
+    policy_jit_dir = os.path.join(package_dir, "policy_jit")
+    export_policy_as_jit(ppo_runner.alg.actor_critic, policy_jit_dir)
+
+    metadata_path = os.path.join(package_dir, "metadata.json")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(summary_metrics, f, indent=2, ensure_ascii=True)
+
+    return {
+        "run_name": run_name,
+        "adapted_group_dir": adapted_group_dir,
+        "package_dir": package_dir,
+        "alpha_path": alpha_path,
+        "policy_jit_dir": policy_jit_dir,
+        "metadata_path": metadata_path,
+    }
 
 
 def _print_upesi_eval_block(title, metrics_dict):
@@ -211,7 +372,7 @@ def play(args):
     env_cfg.domain_rand.randomize_friction = env_cfg.domain_rand.randomize_friction
     env_cfg.domain_rand.push_robots = env_cfg.domain_rand.push_robots
     env_cfg.commands.curriculum = env_cfg.commands.curriculum
-    env_cfg.commands.ranges.lin_vel_x = [0.3, 0.5]
+    env_cfg.commands.ranges.lin_vel_x = [0.7, 0.7]
     env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
     env_cfg.commands.ranges.ang_vel_yaw = [0.0, 0.0]
 
@@ -223,6 +384,7 @@ def play(args):
     # load policy
     train_cfg.runner.resume = True
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args, train_cfg=train_cfg)
+    # Keep a reference for export helpers without changing external APIs.
     # OnPolicyRunner.__init__ performs env.reset(); re-fetch observations to avoid stale pre-reset tensors.
     obs = env.get_observations()
     upesi_eval_mode = str(getattr(args, "upesi_eval_mode", "standard")).strip().lower()
@@ -235,6 +397,16 @@ def play(args):
     # Episode timeouts trigger at episode_length > max_episode_length in the env,
     # so we run one extra step to ensure timeout-completed episodes enter metrics.
     eval_steps = int(env.max_episode_length) + 1
+    if upesi_eval_mode == "identified":
+        upesi_cfg_for_identified = getattr(ppo_runner, "upesi_cfg", {})
+        identified_episode_length_s = upesi_cfg_for_identified.get("identified_eval_episode_length_s", None)
+        identified_episode_length_s = _to_float(identified_episode_length_s)
+        if identified_episode_length_s is not None and identified_episode_length_s > 0.0:
+            eval_steps = max(1, int(np.ceil(identified_episode_length_s / float(env.dt))) + 1)
+            print(
+                f"[UPESI] identified mode episode length override: "
+                f"{identified_episode_length_s:.3f}s -> eval_steps={eval_steps}"
+            )
 
     if upesi_eval_mode == "standard":
         policy = ppo_runner.get_inference_policy(device=env.device)
@@ -360,6 +532,10 @@ def play(args):
             raise ValueError("online_identified UPESI eval requires upesi.enabled = true")
 
         upesi_cfg = getattr(ppo_runner, "upesi_cfg", {})
+        online_eval_rollout_multiplier = float(upesi_cfg.get("online_eval_rollout_multiplier", 1.0))
+        if online_eval_rollout_multiplier <= 0.0:
+            online_eval_rollout_multiplier = 1.0
+        online_eval_steps = max(1, int(np.ceil(float(eval_steps) * online_eval_rollout_multiplier)))
         online_window_size = max(1, int(upesi_cfg.get("online_window_size", 512)))
         online_min_buffer_size_cfg = upesi_cfg.get("online_min_buffer_size", None)
         if online_min_buffer_size_cfg is None:
@@ -370,17 +546,41 @@ def play(args):
                 online_min_buffer_size = online_window_size
         online_update_interval = max(1, int(upesi_cfg.get("online_update_interval", 64)))
         online_alpha_init = str(upesi_cfg.get("online_alpha_init", "zero")).strip().lower()
-        if online_alpha_init not in {"zero", "nominal"}:
-            raise ValueError("upesi.online_alpha_init must be 'zero' or 'nominal'")
+        if online_alpha_init not in {"zero", "nominal", "file"}:
+            raise ValueError("upesi.online_alpha_init must be 'zero', 'nominal' or 'file'")
+        online_alpha_file = str(upesi_cfg.get("online_alpha_file", "")).strip()
+        online_enable_updates = bool(upesi_cfg.get("online_enable_updates", True))
+        cli_online_alpha_file = getattr(args, "upesi_online_alpha_file", None)
+        if cli_online_alpha_file is not None and str(cli_online_alpha_file).strip() != "":
+            online_alpha_file = str(cli_online_alpha_file).strip()
+        cli_resume_alpha = _parse_optional_bool(getattr(args, "upesi_online_resume_alpha", None))
+        if cli_resume_alpha is True:
+            online_alpha_init = "file"
+            online_enable_updates = True
+        elif cli_resume_alpha is False:
+            online_alpha_init = "nominal"
+            online_enable_updates = True
         online_alpha_smoothing_beta = float(upesi_cfg.get("online_alpha_smoothing_beta", 0.2))
         online_alpha_smoothing_beta = float(np.clip(online_alpha_smoothing_beta, 0.0, 1.0))
         online_max_alpha_norm = float(upesi_cfg.get("online_max_alpha_norm", 10.0))
-        online_identify_accept_ratio = 0.999
+        online_identify_accept_ratio = float(upesi_cfg.get("online_identify_accept_ratio", 0.998))
+        if not np.isfinite(online_identify_accept_ratio) or online_identify_accept_ratio <= 0.0:
+            online_identify_accept_ratio = 0.998
+        online_save_final_alpha = bool(upesi_cfg.get("online_save_final_alpha", False))
         identification_steps = getattr(args, "upesi_identification_steps", None)
         identification_lr = getattr(args, "upesi_identification_lr", None)
 
         ppo_runner.alg.actor_critic.eval()
-        if online_alpha_init == "nominal":
+        if online_alpha_init == "file":
+            if online_alpha_file == "":
+                raise ValueError("upesi.online_alpha_file must be set when online_alpha_init='file'")
+            alpha_current = _load_online_alpha_from_file(
+                online_alpha_file,
+                expected_dim=ppo_runner.upesi_embedding_dim,
+                device=env.device,
+            )
+            print(f"[UPESI] Loaded online alpha from file: {online_alpha_file}")
+        elif online_alpha_init == "nominal":
             with torch.inference_mode():
                 theta_zero_norm = torch.zeros(
                     (1, ppo_runner.upesi_theta_dim),
@@ -398,13 +598,36 @@ def play(args):
         trans_obs_buf = None
         trans_action_buf = None
         trans_next_obs_buf = None
-        online_ep_infos = []
-        online_cur_reward_sum = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
-        online_cur_episode_length = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
-        online_finished_returns = []
-        online_finished_lengths = []
+        online_accum = _init_eval_rollout_accumulators(env)
+        online_final_alpha_for_policy = None
+        online_final_alpha_oracle_dist = None
+        online_last_update_alpha_oracle_dist = None
+        online_last_update_step = None
 
-        for step_idx in range(1, eval_steps + 1):
+        for step_idx in range(1, online_eval_steps + 1):
+            # Capture oracle distance for the exact alpha/state used by policy at this step,
+            # before env.step() may trigger auto-resets and theta changes.
+            if step_idx == online_eval_steps:
+                online_final_alpha_for_policy = alpha_current.detach().clone()
+                try:
+                    with torch.inference_mode():
+                        alpha_oracle = ppo_runner.get_oracle_alpha(device=env.device)
+                        if alpha_oracle.ndim == 2 and alpha_oracle.shape[0] > 0:
+                            dist_vec = torch.norm(
+                                alpha_oracle - online_final_alpha_for_policy.view(1, -1),
+                                dim=-1,
+                                p=2,
+                            )
+                            online_final_alpha_oracle_dist = float(dist_vec.mean().item())
+                        elif alpha_oracle.ndim == 1:
+                            online_final_alpha_oracle_dist = float(
+                                torch.norm(alpha_oracle - online_final_alpha_for_policy, p=2).item()
+                            )
+                        else:
+                            online_final_alpha_oracle_dist = None
+                except Exception:
+                    online_final_alpha_oracle_dist = None
+
             with torch.inference_mode():
                 alpha_batch = alpha_current.view(1, -1).expand(obs.shape[0], -1)
                 obs_for_policy = torch.cat((obs.detach(), alpha_batch), dim=-1)
@@ -434,25 +657,17 @@ def play(args):
                         trans_action_buf = trans_action_buf[-online_window_size:]
                         trans_next_obs_buf = trans_next_obs_buf[-online_window_size:]
 
-            rews = rews.to(env.device)
-            online_cur_reward_sum += rews
-            online_cur_episode_length += 1
-            if isinstance(infos, dict) and "episode" in infos:
-                online_ep_infos.append(infos["episode"])
-            online_done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
-            if online_done_ids.numel() > 0:
-                online_finished_returns.extend(
-                    online_cur_reward_sum[online_done_ids].detach().cpu().numpy().tolist()
-                )
-                online_finished_lengths.extend(
-                    online_cur_episode_length[online_done_ids].detach().cpu().numpy().tolist()
-                )
-                online_cur_reward_sum[online_done_ids] = 0
-                online_cur_episode_length[online_done_ids] = 0
+            _accumulate_eval_step(env, online_accum, rews, dones, infos)
             obs = next_obs
 
+            if not online_enable_updates:
+                continue
             if step_idx % online_update_interval != 0:
                 continue
+
+            online_base_height_z = None
+            if hasattr(env, "root_states") and env.root_states is not None:
+                online_base_height_z = float(env.root_states[:, 2].mean().item())
 
             online_buffer_size = 0 if trans_obs_buf is None else int(trans_obs_buf.shape[0])
             if online_buffer_size < online_min_buffer_size:
@@ -464,6 +679,7 @@ def play(args):
                         "online_skip_reason": "insufficient_buffer",
                         "online_buffer_size/current_min_size": f"{online_buffer_size}/{online_min_buffer_size}",
                         "online_alpha_norm": float(alpha_current.norm().item()),
+                        "online_base_height_z": online_base_height_z,
                     },
                 )
                 continue
@@ -512,6 +728,8 @@ def play(args):
                     )
             except Exception:
                 online_alpha_oracle_dist = None
+            online_last_update_alpha_oracle_dist = online_alpha_oracle_dist
+            online_last_update_step = int(step_idx)
 
             _print_upesi_eval_block(
                 "online_identified",
@@ -524,36 +742,73 @@ def play(args):
                     "online_identify_loss_ratio": identify_loss_ratio,
                     "online_buffer_size/current_min_size": f"{online_buffer_size}/{online_min_buffer_size}",
                     "online_alpha_oracle_dist": online_alpha_oracle_dist,
+                    "online_base_height_z": online_base_height_z,
                 },
             )
 
-        online_episode_metrics = _aggregate_episode_metrics(online_ep_infos)
-        final_online_alpha_oracle_dist = None
-        try:
-            with torch.inference_mode():
-                alpha_oracle = ppo_runner.get_oracle_alpha(device=env.device)
-                alpha_oracle_mean = alpha_oracle.mean(dim=0)
-                final_online_alpha_oracle_dist = float(
-                    torch.norm(alpha_current - alpha_oracle_mean, p=2).item()
-                )
-        except Exception:
-            final_online_alpha_oracle_dist = None
+        online_final_metrics = _finalize_eval_rollout_metrics(online_accum)
+        if online_final_alpha_for_policy is None:
+            online_final_alpha_for_policy = alpha_current.detach().clone()
 
         _print_upesi_eval_block(
             "online_identified_summary",
             {
-                "online_return": float(np.mean(online_finished_returns)) if len(online_finished_returns) > 0 else None,
-                "online_episode_length": float(np.mean(online_finished_lengths)) if len(online_finished_lengths) > 0 else None,
-                "online_fall_rate": online_episode_metrics["fall_rate"],
-                "online_timeout_rate": online_episode_metrics["timeout_rate"],
-                "online_contact_termination_rate": online_episode_metrics["contact_termination_rate"],
-                "online_orientation_termination_rate": online_episode_metrics["orientation_termination_rate"],
-                "online_non_timeout_termination_rate": online_episode_metrics["non_timeout_termination_rate"],
-                "online_tracking_error": online_episode_metrics["tracking_error"],
-                "online_final_alpha_norm": float(alpha_current.norm().item()),
-                "online_final_alpha_oracle_dist": final_online_alpha_oracle_dist,
+                "online_return": online_final_metrics["return"],
+                "online_episode_length": online_final_metrics["episode_length"],
+                "online_episodes_finished": online_final_metrics["episodes_finished"],
+                "online_fall_rate": online_final_metrics["fall_rate"],
+                "online_timeout_rate": online_final_metrics["timeout_rate"],
+                "online_contact_termination_rate": online_final_metrics["contact_termination_rate"],
+                "online_orientation_termination_rate": online_final_metrics["orientation_termination_rate"],
+                "online_non_timeout_termination_rate": online_final_metrics["non_timeout_termination_rate"],
+                "online_tracking_error": online_final_metrics["tracking_error"],
+                "online_final_alpha_norm": float(online_final_alpha_for_policy.norm().item()),
+                "online_final_alpha_oracle_dist": online_final_alpha_oracle_dist,
+                "online_last_update_alpha_oracle_dist": online_last_update_alpha_oracle_dist,
+                "online_last_update_step": float(online_last_update_step) if online_last_update_step is not None else None,
+                "online_eval_steps": float(online_eval_steps),
+                "online_enable_updates": float(1.0 if online_enable_updates else 0.0),
             },
         )
+        if online_save_final_alpha:
+            summary_metrics = {
+                "mode": "online_identified",
+                "task": str(args.task),
+                "run_name": str(_resolve_combined_run_name(train_cfg, args)),
+                "online_eval_steps": int(online_eval_steps),
+                "online_enable_updates": bool(online_enable_updates),
+                "online_return": online_final_metrics["return"],
+                "online_episode_length": online_final_metrics["episode_length"],
+                "online_episodes_finished": online_final_metrics["episodes_finished"],
+                "online_fall_rate": online_final_metrics["fall_rate"],
+                "online_timeout_rate": online_final_metrics["timeout_rate"],
+                "online_contact_termination_rate": online_final_metrics["contact_termination_rate"],
+                "online_orientation_termination_rate": online_final_metrics["orientation_termination_rate"],
+                "online_non_timeout_termination_rate": online_final_metrics["non_timeout_termination_rate"],
+                "online_tracking_error": online_final_metrics["tracking_error"],
+                "online_final_alpha_norm": float(online_final_alpha_for_policy.norm().item()),
+                "online_final_alpha_oracle_dist": online_final_alpha_oracle_dist,
+                "online_last_update_alpha_oracle_dist": online_last_update_alpha_oracle_dist,
+                "online_last_update_step": online_last_update_step,
+                "source_experiment_name": str(getattr(train_cfg.runner, "experiment_name", "unknown")),
+                "source_load_run": str(getattr(train_cfg.runner, "load_run", "unknown")),
+                "source_checkpoint": str(getattr(train_cfg.runner, "checkpoint", "unknown")),
+            }
+            export_info = _create_adapted_export_package(
+                train_cfg=train_cfg,
+                ppo_runner=ppo_runner,
+                args=args,
+                alpha=online_final_alpha_for_policy,
+                summary_metrics=summary_metrics,
+            )
+            print(f"[UPESI] Saved adapted package: {export_info['package_dir']}")
+            if online_alpha_file != "":
+                _save_online_alpha_to_file(
+                    online_alpha_file,
+                    alpha=online_final_alpha_for_policy,
+                    metadata=summary_metrics,
+                )
+                print(f"[UPESI] Saved online alpha to explicit file: {online_alpha_file}")
     
     # export policy as a jit module (used to run it from C++)
     if EXPORT_POLICY:

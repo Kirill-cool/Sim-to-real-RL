@@ -162,6 +162,10 @@ def get_args():
          "help": "Override number of gradient steps in identify_alpha during play."},
         {"name": "--upesi_identification_lr", "type": float, "default": None,
          "help": "Override Adam LR for identify_alpha during play."},
+        {"name": "--upesi_online_resume_alpha", "type": str, "nargs": "?", "const": "true", "default": None,
+         "help": "Online identified mode only: true=resume adaptation from saved alpha file, false=fresh adaptation from nominal alpha."},
+        {"name": "--upesi_online_alpha_file", "type": str, "default": None,
+         "help": "Online identified mode only: override path to alpha file for resume and/or save."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

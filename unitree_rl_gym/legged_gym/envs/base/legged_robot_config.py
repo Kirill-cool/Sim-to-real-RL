@@ -10,6 +10,8 @@ class LeggedRobotCfg(BaseConfig):
         send_timeouts = True # send time out information to the algorithm
         episode_length_s = 20 # episode length in seconds
         test = False
+        # In test/eval mode only, ignore contact termination for the first N steps after reset.
+        termination_grace_steps = 0
 
     class terrain:
         mesh_type = 'plane' # "heightfield" # none, plane, heightfield or trimesh
@@ -104,20 +106,20 @@ class LeggedRobotCfg(BaseConfig):
             tracking_lin_vel = 1.0
             tracking_ang_vel = 0.5
             lin_vel_z = -2.0
-            ang_vel_xy = -0.05
-            orientation = -0.
+            ang_vel_xy = -0.1
+            orientation = -1.
             torques = -0.00001
             dof_vel = -0.
             dof_acc = -2.5e-7
-            base_height = -0.3
-            feet_air_time =  1.0
+            base_height = -0.5
+            feet_air_time =  0.55
             collision = -1.
             feet_stumble = -0.0 
             action_rate = -0.01
-            stand_still = -0.
+            stand_still = -0.5
 
         only_positive_rewards = True # if true negative total rewards are clipped at zero (avoids early termination problems)
-        tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)
+        tracking_sigma = 0.20 # tracking reward = exp(-error^2/sigma)
         soft_dof_pos_limit = 1. # percentage of urdf limits, values above this limit are penalized
         soft_dof_vel_limit = 1.
         soft_torque_limit = 1.
@@ -149,7 +151,7 @@ class LeggedRobotCfg(BaseConfig):
     class viewer:
         ref_env = 0
         pos = [10, 0, 6]  # [m]
-        lookat = [11., 5, 3.]  # [m]
+        lookat = [0., 0, 0.]  # [m]
 
     class sim:
         dt =  0.005
@@ -208,7 +210,7 @@ class LeggedRobotCfgPPO(BaseConfig):
         policy_class_name = 'ActorCritic'
         algorithm_class_name = 'PPO'
         num_steps_per_env = 24 # per iteration
-        max_iterations = 3000 # number of policy updates
+        max_iterations = 5000 # number of policy updates
 
         # logging
         save_interval = 50 # check for potential saves every this many iterations
@@ -222,23 +224,24 @@ class LeggedRobotCfgPPO(BaseConfig):
 
     class upesi:
         enabled = False
-        embedding_dim = 4
-        theta_dim = 2
+        embedding_dim = 8
+        alpha_scale = 1.0
+        theta_dim = 14
         theta_keys = ["added_mass", "friction_coeff"]
         # Global normalization bounds that should cover both nominal DR and full CDR target ranges.
         theta_min = [-3.0, 0.1]
         theta_max = [3.0, 1.5]
-        dynamics_lr = 1.0e-3
-        dynamics_batch_size = 2048
-        dynamics_updates_per_iter = 4
-        lambda_rec = 0.1
-        buffer_size = 200000
+        dynamics_lr = 3.0e-4
+        dynamics_batch_size = 4096
+        dynamics_updates_per_iter = 2
+        lambda_rec = 0.05
+        buffer_size = 500000
         predict_delta_obs = True
         # If true, include base linear velocity in dynamics-loss observation subset.
         dynamics_include_base_lin_vel = True
         detach_encoder_for_ppo = True
         identification_lr = 1.0e-3
-        identification_steps = 200
+        identification_steps = 300
         # Optional episode length override (seconds) used only in play.py for upesi_eval_mode="identified".
         # None or <=0 keeps the default env episode length.
         identified_eval_episode_length_s = 5.0
@@ -249,19 +252,26 @@ class LeggedRobotCfgPPO(BaseConfig):
         online_window_size = 1024
         # Minimum number of valid transitions required to run online identification.
         # If None or <=0 in code, defaults to online_window_size.
-        online_min_buffer_size = 256
-        online_update_interval = 128
-        online_alpha_init = "nominal"  # "zero" | "nominal" | "file"
+        online_min_buffer_size = 512
+        online_update_interval = 256
+        online_alpha_init = "zero"  # "zero" | "nominal" | "file"
         # Path to serialized alpha for online_alpha_init="file" and/or saving final alpha.
         online_alpha_file = ""
         # If false, run fixed-alpha playback in online_identified mode (no online adaptation updates).
-        online_enable_updates = True
-        online_alpha_smoothing_beta = 0.3
+        online_enable_updates = False
+        online_alpha_smoothing_beta = 0.2
         online_max_alpha_norm = 10.0
         # Accept online alpha update only if identify_loss_ratio < this threshold.
-        online_identify_accept_ratio = 0.995
+        online_identify_accept_ratio = 0.997
         # Multiplier for play.py rollout length in online_identified mode only.
         # 1.0 keeps default length: int(env.max_episode_length) + 1.
         online_eval_rollout_multiplier = 1.0
+        # Optional episode length override (seconds) for online_identified mode only.
+        # None or <=0 keeps the default env episode length.
+        online_identified_episode_length_s = None
         # If true, save final alpha after online_identified run.
         online_save_final_alpha = False
+        # Play/eval-only startup stabilization before commanded motion.
+        eval_startup_stand_steps = 0
+        eval_startup_ramp_steps = 0
+        eval_startup_hold_command = True

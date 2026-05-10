@@ -56,6 +56,24 @@ class GO2RoughCfg( LeggedRobotCfg ):
         push_vel_xy_nominal = 0.0
         push_vel_xy_max_range = [-1., 1.]
 
+        motor_strength_range = [0.95, 1.05]
+        motor_strength_nominal = 1.0
+        motor_strength_max_range = [0.8, 1.2]
+
+        joint_damping_range = [0.9, 1.1]
+        joint_damping_nominal = 1.0
+        joint_damping_max_range = [0.5, 1.5]
+
+        # Torque-like Coulomb friction magnitude per joint, applied via tanh(v/eps).
+        static_joint_friction_range = [0.0, 0.3]
+        static_joint_friction_nominal = 0.0
+        static_joint_friction_max_range = [0.0, 0.6]
+        static_friction_eps = 0.05
+
+        observation_noise_range = [0.9, 1.1]
+        observation_noise_nominal = 1.0
+        observation_noise_max_range = [0.5, 1.5]
+
         class cdr:
             enabled = False
             initial_level = 1.0
@@ -77,11 +95,58 @@ class GO2RoughCfgPPO( LeggedRobotCfgPPO ):
     class algorithm( LeggedRobotCfgPPO.algorithm ):
         entropy_coef = 0.01
     class upesi(LeggedRobotCfgPPO.upesi):
-        # Global UPESI normalization bounds (must not change with CDR level).
-        # Covers both fixed DR ranges and final CDR target ranges.
-        theta_min = [-2.0, 0.5]   # [added_mass_min, friction_coeff_min]
-        theta_max = [2.0, 1.25]   # [added_mass_max, friction_coeff_max]
-        freeze_encoder_after_iter = 1500
+        embedding_dim = 8
+        theta_dim = 14
+        alpha_scale = 1.0
+        theta_keys = [
+            "added_mass",
+            "surface_friction",
+            "motor_strength_FL",
+            "motor_strength_FR",
+            "motor_strength_RL",
+            "motor_strength_RR",
+            "joint_damping_FL",
+            "joint_damping_FR",
+            "joint_damping_RL",
+            "joint_damping_RR",
+            "static_joint_friction_FL",
+            "static_joint_friction_FR",
+            "static_joint_friction_RL",
+            "static_joint_friction_RR",
+        ]
+        theta_min = [
+            -2.0,
+            0.5,
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+        theta_max = [
+            2.0,
+            1.25,
+            1.2,
+            1.2,
+            1.2,
+            1.2,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            0.6,
+            0.6,
+            0.6,
+            0.6,
+        ]
+        freeze_encoder_after_iter = 2500
     class runner( LeggedRobotCfgPPO.runner ):
         run_name = ''
         experiment_name = 'rough_go2'

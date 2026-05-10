@@ -166,6 +166,18 @@ def get_args():
          "help": "Online identified mode only: true=resume adaptation from saved alpha file, false=fresh adaptation from nominal alpha."},
         {"name": "--upesi_online_alpha_file", "type": str, "default": None,
          "help": "Online identified mode only: override path to alpha file for resume and/or save."},
+        {"name": "--upesi_eval_hard_domain", "type": str, "nargs": "?", "const": "true", "default": None,
+         "help": "UPESI eval only: true enables harder domain-randomized evaluation for oracle/identified/online_identified."},
+        {"name": "--play_startup_stand_steps", "type": int, "default": None,
+         "help": "Play/eval only: number of initial steps with zeroed policy actions (stabilization before motion)."},
+        {"name": "--play_startup_ramp_steps", "type": int, "default": None,
+         "help": "Play/eval only: number of subsequent steps to linearly ramp policy actions from 0 to 1."},
+        {"name": "--play_startup_hold_command", "type": str, "nargs": "?", "const": "true", "default": None,
+         "help": "Play/eval only: true holds commanded velocity at zero during startup stand phase."},
+        {"name": "--play_heading_command", "type": str, "nargs": "?", "const": "true", "default": None,
+         "help": "Play/eval only: override heading_command (true/false) without affecting training configs."},
+        {"name": "--play_heading", "type": float, "default": None,
+         "help": "Play/eval only: fixed heading target (rad). If set, heading_command is enabled and heading range is clamped to this value."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

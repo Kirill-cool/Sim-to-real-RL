@@ -123,6 +123,10 @@ class LeggedRobot(BaseTask):
         self.termination_contact_buf = torch.any(
             torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1
         )
+        grace_steps = int(getattr(self.cfg.env, "termination_grace_steps", 0))
+        if bool(getattr(self.cfg.env, "test", False)) and grace_steps > 0:
+            grace_mask = self.episode_length_buf <= grace_steps
+            self.termination_contact_buf = self.termination_contact_buf & (~grace_mask)
         self.termination_orientation_buf = torch.logical_or(
             torch.abs(self.rpy[:, 1]) > 1.0,
             torch.abs(self.rpy[:, 0]) > 0.8,

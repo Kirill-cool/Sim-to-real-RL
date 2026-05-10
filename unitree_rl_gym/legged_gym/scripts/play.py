@@ -203,12 +203,40 @@ def _finalize_eval_rollout_metrics(accum):
     }
 
 
-def _run_eval_rollout(env, policy, obs, num_steps):
+def _log_eval_early_termination(env, dones, step_idx, total_steps, mode_label):
+    if step_idx >= total_steps:
+        return
+    done_ids = (dones.to(env.device) > 0).nonzero(as_tuple=False).flatten()
+    if done_ids.numel() == 0:
+        return
+
+    done_count = int(done_ids.numel())
+    timeout_count = 0
+    contact_count = 0
+    orientation_count = 0
+    if hasattr(env, "termination_timeout_buf"):
+        timeout_count = int(env.termination_timeout_buf[done_ids].bool().sum().item())
+    if hasattr(env, "termination_contact_buf"):
+        contact_count = int(env.termination_contact_buf[done_ids].bool().sum().item())
+    if hasattr(env, "termination_orientation_buf"):
+        orientation_count = int(env.termination_orientation_buf[done_ids].bool().sum().item())
+
+    ids_preview = done_ids[:8].detach().cpu().numpy().tolist()
+    print(
+        f"[Play Early Termination] mode={mode_label} step={int(step_idx)}/{int(total_steps)} "
+        f"done={done_count} timeout={timeout_count} contact={contact_count} orientation={orientation_count} "
+        f"env_ids={ids_preview}"
+    )
+
+
+def _run_eval_rollout(env, policy, obs, num_steps, startup_cfg=None, global_step_offset=0, mode_label="eval"):
     accum = _init_eval_rollout_accumulators(env)
 
-    for _ in range(num_steps):
+    for step_idx in range(1, num_steps + 1):
         actions = policy(obs.detach())
+        actions = _apply_eval_startup_phase(env, actions, global_step_offset + step_idx, startup_cfg=startup_cfg)
         obs, _, rews, dones, infos = env.step(actions.detach())
+        _log_eval_early_termination(env, dones, step_idx, num_steps, mode_label=mode_label)
         _accumulate_eval_step(env, accum, rews, dones, infos)
 
     final_metrics = _finalize_eval_rollout_metrics(accum)
@@ -229,6 +257,76 @@ def _run_eval_rollout(env, policy, obs, num_steps):
         "contact_and_orientation_non_timeout_rate": final_metrics["contact_and_orientation_non_timeout_rate"],
         "other_non_timeout_rate": final_metrics["other_non_timeout_rate"],
     }
+
+
+def _get_range_center(range_like, fallback):
+    if isinstance(range_like, (list, tuple, np.ndarray)) and len(range_like) >= 2:
+        return 0.5 * (float(range_like[0]) + float(range_like[1]))
+    return float(fallback)
+
+
+def _prepare_eval_startup_cfg(args, upesi_cfg, env):
+    stand_default = int(upesi_cfg.get("eval_startup_stand_steps", 0))
+    ramp_default = int(upesi_cfg.get("eval_startup_ramp_steps", 0))
+    hold_default = bool(upesi_cfg.get("eval_startup_hold_command", True))
+
+    cli_stand = getattr(args, "play_startup_stand_steps", None)
+    cli_ramp = getattr(args, "play_startup_ramp_steps", None)
+    cli_hold = _parse_optional_bool(getattr(args, "play_startup_hold_command", None))
+
+    stand_steps = int(stand_default if cli_stand is None else cli_stand)
+    ramp_steps = int(ramp_default if cli_ramp is None else cli_ramp)
+    hold_command = hold_default if cli_hold is None else bool(cli_hold)
+
+    stand_steps = max(0, stand_steps)
+    ramp_steps = max(0, ramp_steps)
+    enabled = (stand_steps + ramp_steps) > 0
+
+    target_command = None
+    if hasattr(env, "commands") and env.commands is not None and env.commands.ndim == 2 and env.commands.shape[1] >= 3:
+        target_command = (
+            _get_range_center(getattr(env.cfg.commands.ranges, "lin_vel_x", [0.0, 0.0]), 0.0),
+            _get_range_center(getattr(env.cfg.commands.ranges, "lin_vel_y", [0.0, 0.0]), 0.0),
+            _get_range_center(getattr(env.cfg.commands.ranges, "ang_vel_yaw", [0.0, 0.0]), 0.0),
+        )
+
+    return {
+        "enabled": bool(enabled),
+        "stand_steps": int(stand_steps),
+        "ramp_steps": int(ramp_steps),
+        "hold_command": bool(hold_command),
+        "target_command": target_command,
+    }
+
+
+def _apply_eval_startup_phase(env, actions, step_idx, startup_cfg):
+    if startup_cfg is None or not bool(startup_cfg.get("enabled", False)):
+        return actions
+
+    stand_steps = int(startup_cfg.get("stand_steps", 0))
+    ramp_steps = int(startup_cfg.get("ramp_steps", 0))
+    total_steps = stand_steps + ramp_steps
+
+    if hasattr(env, "commands") and env.commands is not None and env.commands.ndim == 2 and env.commands.shape[1] >= 3:
+        if bool(startup_cfg.get("hold_command", False)) and step_idx <= stand_steps:
+            env.commands[:, 0] = 0.0
+            env.commands[:, 1] = 0.0
+            env.commands[:, 2] = 0.0
+        elif step_idx <= total_steps:
+            target_command = startup_cfg.get("target_command", None)
+            if target_command is not None:
+                env.commands[:, 0] = float(target_command[0])
+                env.commands[:, 1] = float(target_command[1])
+                env.commands[:, 2] = float(target_command[2])
+
+    if step_idx <= stand_steps:
+        action_scale = 0.0
+    elif ramp_steps > 0 and step_idx <= total_steps:
+        action_scale = float(step_idx - stand_steps) / float(ramp_steps)
+    else:
+        action_scale = 1.0
+
+    return actions * float(np.clip(action_scale, 0.0, 1.0))
 
 
 def _fmt_metric(value, precision=6):
@@ -361,8 +459,131 @@ def _print_upesi_eval_block(title, metrics_dict):
             print(f"  {key}: {value}")
 
 
+def _to_range_pair(value, fallback):
+    if value is None:
+        value = fallback
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) >= 2:
+            low, high = float(value[0]), float(value[1])
+        elif len(value) == 1:
+            low = high = float(value[0])
+        else:
+            low, high = float(fallback[0]), float(fallback[1])
+    else:
+        low = high = float(value)
+    if low > high:
+        low, high = high, low
+    return [low, high]
+
+
+def _biased_subrange(base_range, bias="full", hardness=0.35):
+    low, high = _to_range_pair(base_range, [0.0, 0.0])
+    span = max(0.0, high - low)
+    if span <= 0.0 or bias == "full":
+        return [float(low), float(high)]
+    hardness = float(np.clip(hardness, 0.0, 1.0))
+    if bias == "low":
+        return [float(low), float(low + hardness * span)]
+    if bias == "high":
+        return [float(high - hardness * span), float(high)]
+    return [float(low), float(high)]
+
+
+def _configure_upesi_eval_hard_domain(env):
+    if not hasattr(env, "domain_rand_current_ranges"):
+        return {}
+    current = getattr(env, "domain_rand_current_ranges", None)
+    if not isinstance(current, dict):
+        return {}
+    max_ranges = getattr(env, "domain_rand_max_ranges", {})
+    if not isinstance(max_ranges, dict):
+        max_ranges = {}
+
+    def _get_range(key, fallback):
+        if key in max_ranges:
+            return _to_range_pair(max_ranges[key], fallback)
+        if key in current:
+            return _to_range_pair(current[key], fallback)
+        return _to_range_pair(fallback, fallback)
+
+    hard_ranges = {}
+    if "added_mass_range" in current or "added_mass_range" in max_ranges:
+        hard_ranges["added_mass_range"] = _biased_subrange(
+            _get_range("added_mass_range", [0.0, 0.0]),
+            bias="full",
+            hardness=1.0,
+        )
+    if "friction_range" in current or "friction_range" in max_ranges:
+        hard_ranges["friction_range"] = _biased_subrange(
+            _get_range("friction_range", [1.0, 1.0]),
+            bias="low",
+            hardness=0.5,
+        )
+    if "motor_strength_range" in current or "motor_strength_range" in max_ranges:
+        hard_ranges["motor_strength_range"] = _biased_subrange(
+            _get_range("motor_strength_range", [1.0, 1.0]),
+            bias="low",
+            hardness=0.5,
+        )
+    if "joint_damping_range" in current or "joint_damping_range" in max_ranges:
+        hard_ranges["joint_damping_range"] = _biased_subrange(
+            _get_range("joint_damping_range", [1.0, 1.0]),
+            bias="high",
+            hardness=0.5,
+        )
+    if "static_joint_friction_range" in current or "static_joint_friction_range" in max_ranges:
+        hard_ranges["static_joint_friction_range"] = _biased_subrange(
+            _get_range("static_joint_friction_range", [0.0, 0.0]),
+            bias="high",
+            hardness=0.5,
+        )
+
+    # Keep observation noise unchanged by default, unless the task explicitly wants to expand it.
+    if "observation_noise_range" in current:
+        hard_ranges["observation_noise_range"] = _to_range_pair(
+            current["observation_noise_range"],
+            [1.0, 1.0],
+        )
+
+    for key, value in hard_ranges.items():
+        current[key] = list(value)
+
+    cfg_dr = getattr(getattr(env, "cfg", None), "domain_rand", None)
+    if cfg_dr is not None:
+        for key, value in hard_ranges.items():
+            if hasattr(cfg_dr, key):
+                setattr(cfg_dr, key, list(value))
+    return hard_ranges
+
+
+def _log_upesi_theta_stats(env, label):
+    if not hasattr(env, "get_current_upesi_theta"):
+        return
+    theta = env.get_current_upesi_theta()
+    if not isinstance(theta, torch.Tensor) or theta.ndim != 2 or theta.shape[0] == 0:
+        return
+    theta_np = theta.detach().cpu().numpy()
+    if hasattr(env, "get_upesi_theta_keys"):
+        theta_keys = list(env.get_upesi_theta_keys())
+    else:
+        theta_keys = [f"theta_{idx}" for idx in range(theta_np.shape[1])]
+    parts = []
+    for idx, key in enumerate(theta_keys):
+        if idx >= theta_np.shape[1]:
+            break
+        col = theta_np[:, idx]
+        parts.append(
+            f"{key}:mean={float(col.mean()):.4f},std={float(col.std()):.4f},"
+            f"min={float(col.min()):.4f},max={float(col.max()):.4f}"
+        )
+    print(f"[UPESI Eval] {label} theta stats | " + " | ".join(parts))
+
+
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+    # Play-only manual heading overrides (edit directly here; no CLI flags required).
+    manual_heading_command = False   # None | True | False
+    manual_heading_target_rad = 0.0  # None | float (e.g. 0.0)
     # Keep explicit play overrides, but set them equal to task/train config values.
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 100)
     env_cfg.terrain.num_rows = 5
@@ -376,7 +597,20 @@ def play(args):
     env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
     env_cfg.commands.ranges.ang_vel_yaw = [0.0, 0.0]
 
-    env_cfg.commands.heading_command = False
+    if manual_heading_command is not None:
+        env_cfg.commands.heading_command = bool(manual_heading_command)
+    else:
+        play_heading_command = _parse_optional_bool(getattr(args, "play_heading_command", None))
+        if play_heading_command is not None:
+            env_cfg.commands.heading_command = bool(play_heading_command)
+
+    play_heading = manual_heading_target_rad
+    if play_heading is None:
+        play_heading = getattr(args, "play_heading", None)
+    if play_heading is not None:
+        env_cfg.commands.heading_command = True
+        env_cfg.commands.ranges.heading = [float(play_heading), float(play_heading)]
+        print(f"[Play] Fixed heading target: {float(play_heading):.4f} rad")
     env_cfg.env.test = True
 
     # prepare environment
@@ -393,6 +627,33 @@ def play(args):
             f"Unknown upesi_eval_mode='{upesi_eval_mode}'. "
             "Use one of: standard, oracle, identified, online_identified."
         )
+    hard_domain_flag = _parse_optional_bool(getattr(args, "upesi_eval_hard_domain", None))
+    hard_domain_enabled = bool(hard_domain_flag) if hard_domain_flag is not None else False
+    print(f"UPESI eval hard domain: {hard_domain_enabled}")
+    if hard_domain_enabled and upesi_eval_mode in {"oracle", "identified", "online_identified"}:
+        hard_ranges = _configure_upesi_eval_hard_domain(env)
+        if len(hard_ranges) > 0:
+            hard_ranges_pretty = " | ".join(
+                f"{k}[{float(v[0]):.4f},{float(v[1]):.4f}]"
+                for k, v in hard_ranges.items()
+            )
+            print(f"[UPESI Eval] hard-domain ranges: {hard_ranges_pretty}")
+        else:
+            print("[UPESI Eval] hard-domain ranges: n/a (env does not expose domain_rand_current_ranges)")
+        obs, _ = env.reset()
+        _log_upesi_theta_stats(env, label="post-hard-reset")
+
+    upesi_cfg_for_eval = getattr(ppo_runner, "upesi_cfg", {})
+    eval_startup_cfg = _prepare_eval_startup_cfg(args, upesi_cfg_for_eval, env)
+    if eval_startup_cfg["enabled"]:
+        print(
+            "[Play Startup] enabled | "
+            f"stand_steps={eval_startup_cfg['stand_steps']} "
+            f"ramp_steps={eval_startup_cfg['ramp_steps']} "
+            f"hold_command={eval_startup_cfg['hold_command']}"
+        )
+    else:
+        print("[Play Startup] disabled")
 
     # Episode timeouts trigger at episode_length > max_episode_length in the env,
     # so we run one extra step to ensure timeout-completed episodes enter metrics.
@@ -410,14 +671,39 @@ def play(args):
 
     if upesi_eval_mode == "standard":
         policy = ppo_runner.get_inference_policy(device=env.device)
-        for _ in range(eval_steps):
+        for step_idx in range(1, eval_steps + 1):
             actions = policy(obs.detach())
-            obs, _, _, _, _ = env.step(actions.detach())
+            actions = _apply_eval_startup_phase(env, actions, step_idx, startup_cfg=eval_startup_cfg)
+            obs, _, _, dones, _ = env.step(actions.detach())
+            _log_eval_early_termination(env, dones, step_idx, eval_steps, mode_label="standard")
     elif upesi_eval_mode == "oracle":
+        upesi_cfg = getattr(ppo_runner, "upesi_cfg", {})
+        oracle_eval_steps = int(eval_steps)
+        online_episode_length_s = _to_float(upesi_cfg.get("online_identified_episode_length_s", None))
+        if online_episode_length_s is not None and online_episode_length_s > 0.0:
+            env.max_episode_length_s = float(online_episode_length_s)
+            env.max_episode_length = float(np.ceil(online_episode_length_s / float(env.dt)))
+            oracle_eval_steps = int(env.max_episode_length) + 1
+            print(
+                f"[UPESI] oracle mode episode length override (synced with online): "
+                f"{online_episode_length_s:.3f}s -> max_episode_length={int(env.max_episode_length)} "
+                f"eval_steps={oracle_eval_steps}"
+            )
+        online_eval_rollout_multiplier = float(upesi_cfg.get("online_eval_rollout_multiplier", 1.0))
+        if online_eval_rollout_multiplier <= 0.0:
+            online_eval_rollout_multiplier = 1.0
+        oracle_eval_steps = max(1, int(np.ceil(float(oracle_eval_steps) * online_eval_rollout_multiplier)))
+        print(
+            f"[UPESI] oracle mode rollout multiplier (synced with online): "
+            f"{online_eval_rollout_multiplier:.3f} -> oracle_eval_steps={oracle_eval_steps}"
+        )
+
         policy = ppo_runner.get_oracle_inference_policy(device=env.device)
         alpha_oracle = ppo_runner.get_oracle_alpha(device=env.device)
         oracle_alpha_norm = float(alpha_oracle.norm(dim=-1).mean().item())
-        oracle_eval = _run_eval_rollout(env, policy, obs, eval_steps)
+        oracle_eval = _run_eval_rollout(
+            env, policy, obs, oracle_eval_steps, startup_cfg=eval_startup_cfg, mode_label="oracle"
+        )
         _print_upesi_eval_block(
             "oracle",
             {
@@ -479,11 +765,15 @@ def play(args):
             alpha_star_oracle_dist = float(torch.norm(alpha_star.view(-1) - alpha_oracle_mean, p=2).item())
 
         obs, _ = env.reset()
-        identified_eval = _run_eval_rollout(env, policy, obs, eval_steps)
+        identified_eval = _run_eval_rollout(
+            env, policy, obs, eval_steps, startup_cfg=eval_startup_cfg, mode_label="identified"
+        )
 
         obs, _ = env.reset()
         oracle_policy = ppo_runner.get_oracle_inference_policy(device=env.device)
-        oracle_eval = _run_eval_rollout(env, oracle_policy, obs, eval_steps)
+        oracle_eval = _run_eval_rollout(
+            env, oracle_policy, obs, eval_steps, startup_cfg=eval_startup_cfg, mode_label="identified_oracle_ref"
+        )
 
         return_diff = None
         if identified_eval["return"] is not None and oracle_eval["return"] is not None:
@@ -532,6 +822,17 @@ def play(args):
             raise ValueError("online_identified UPESI eval requires upesi.enabled = true")
 
         upesi_cfg = getattr(ppo_runner, "upesi_cfg", {})
+        online_episode_length_s = _to_float(upesi_cfg.get("online_identified_episode_length_s", None))
+        if online_episode_length_s is not None and online_episode_length_s > 0.0:
+            env.max_episode_length_s = float(online_episode_length_s)
+            env.max_episode_length = float(np.ceil(online_episode_length_s / float(env.dt)))
+            eval_steps = int(env.max_episode_length) + 1
+            print(
+                f"[UPESI] online_identified episode length override: "
+                f"{online_episode_length_s:.3f}s -> max_episode_length={int(env.max_episode_length)} "
+                f"eval_steps={eval_steps}"
+            )
+
         online_eval_rollout_multiplier = float(upesi_cfg.get("online_eval_rollout_multiplier", 1.0))
         if online_eval_rollout_multiplier <= 0.0:
             online_eval_rollout_multiplier = 1.0
@@ -556,10 +857,8 @@ def play(args):
         cli_resume_alpha = _parse_optional_bool(getattr(args, "upesi_online_resume_alpha", None))
         if cli_resume_alpha is True:
             online_alpha_init = "file"
-            online_enable_updates = True
         elif cli_resume_alpha is False:
             online_alpha_init = "nominal"
-            online_enable_updates = True
         online_alpha_smoothing_beta = float(upesi_cfg.get("online_alpha_smoothing_beta", 0.2))
         online_alpha_smoothing_beta = float(np.clip(online_alpha_smoothing_beta, 0.0, 1.0))
         online_max_alpha_norm = float(upesi_cfg.get("online_max_alpha_norm", 10.0))
@@ -587,7 +886,13 @@ def play(args):
                     dtype=torch.float,
                     device=env.device,
                 )
-                alpha_current = ppo_runner.upesi_encoder(theta_zero_norm).view(-1).detach().clone()
+                if hasattr(ppo_runner, "_encode_upesi_alpha"):
+                    alpha_nominal = ppo_runner._encode_upesi_alpha(theta_zero_norm)
+                else:
+                    raw_alpha = ppo_runner.upesi_encoder(theta_zero_norm)
+                    alpha_scale = float(getattr(ppo_runner, "upesi_alpha_scale", 1.0))
+                    alpha_nominal = alpha_scale * torch.tanh(raw_alpha)
+                alpha_current = alpha_nominal.view(-1).detach().clone()
         else:
             alpha_current = torch.zeros(
                 (ppo_runner.upesi_embedding_dim,),
@@ -632,7 +937,11 @@ def play(args):
                 alpha_batch = alpha_current.view(1, -1).expand(obs.shape[0], -1)
                 obs_for_policy = torch.cat((obs.detach(), alpha_batch), dim=-1)
                 actions = ppo_runner.alg.actor_critic.act_inference(obs_for_policy)
+                actions = _apply_eval_startup_phase(env, actions, step_idx, startup_cfg=eval_startup_cfg)
                 next_obs, _, rews, dones, infos = env.step(actions.detach())
+            _log_eval_early_termination(
+                env, dones, step_idx, online_eval_steps, mode_label="online_identified"
+            )
 
             dones_mask = dones.to(env.device).view(-1).bool()
             valid_mask = torch.logical_not(dones_mask)
@@ -679,7 +988,6 @@ def play(args):
                         "online_skip_reason": "insufficient_buffer",
                         "online_buffer_size/current_min_size": f"{online_buffer_size}/{online_min_buffer_size}",
                         "online_alpha_norm": float(alpha_current.norm().item()),
-                        "online_base_height_z": online_base_height_z,
                     },
                 )
                 continue
@@ -742,7 +1050,6 @@ def play(args):
                     "online_identify_loss_ratio": identify_loss_ratio,
                     "online_buffer_size/current_min_size": f"{online_buffer_size}/{online_min_buffer_size}",
                     "online_alpha_oracle_dist": online_alpha_oracle_dist,
-                    "online_base_height_z": online_base_height_z,
                 },
             )
 

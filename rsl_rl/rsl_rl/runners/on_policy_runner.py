@@ -79,12 +79,18 @@ class OnPolicyRunner:
                 )
             self.upesi_embedding_dim = int(self.upesi_cfg.get("embedding_dim", 16))
             self.upesi_theta_dim = int(self.upesi_cfg.get("theta_dim", 2))
-            if self.upesi_theta_dim != 2:
-                raise ValueError(f"UPESI expects theta_dim=2, got {self.upesi_theta_dim}")
-            self.upesi_theta_keys = list(self.upesi_cfg.get("theta_keys", ["added_mass", "friction_coeff"]))
-            if self.upesi_theta_keys != ["added_mass", "friction_coeff"]:
+            self.upesi_theta_keys = list(
+                self.upesi_cfg.get(
+                    "theta_keys",
+                    ["added_mass", "friction_coeff"],
+                )
+            )
+            if self.upesi_theta_dim <= 0:
+                raise ValueError(f"UPESI theta_dim must be > 0, got {self.upesi_theta_dim}")
+            if len(self.upesi_theta_keys) != self.upesi_theta_dim:
                 raise ValueError(
-                    "UPESI requires theta_keys to be exactly ['added_mass', 'friction_coeff'] in fixed order"
+                    "UPESI theta configuration mismatch: "
+                    f"theta_dim={self.upesi_theta_dim} but len(theta_keys)={len(self.upesi_theta_keys)}"
                 )
             self.upesi_theta_min = torch.tensor(
                 self.upesi_cfg.get("theta_min", [-3.0, 0.1]), dtype=torch.float, device=self.device
@@ -96,6 +102,9 @@ class OnPolicyRunner:
                 raise ValueError("UPESI theta_min/theta_max shape mismatch with theta_dim")
 
             self.upesi_theta_eps = 1e-6
+            self.upesi_alpha_scale = float(self.upesi_cfg.get("alpha_scale", 1.0))
+            if self.upesi_alpha_scale <= 0.0:
+                raise ValueError(f"UPESI alpha_scale must be > 0, got {self.upesi_alpha_scale}")
             self.upesi_detach_encoder_for_ppo = bool(self.upesi_cfg.get("detach_encoder_for_ppo", True))
             self.upesi_predict_delta_obs = bool(self.upesi_cfg.get("predict_delta_obs", True))
             self.upesi_dynamics_include_base_lin_vel = bool(
@@ -191,6 +200,12 @@ class OnPolicyRunner:
             if self.upesi_obs_dyn_dim >= int(self.base_actor_obs_dim):
                 raise ValueError(
                     "[UPESI] obs_dyn_indices must be a strict subset of observation dimensions."
+                )
+            env_theta = self.env.get_current_upesi_theta()
+            if env_theta.shape[-1] != self.upesi_theta_dim:
+                raise ValueError(
+                    f"[UPESI] env theta shape mismatch: env_theta.shape={tuple(env_theta.shape)} "
+                    f"but theta_dim={self.upesi_theta_dim}"
                 )
             print(
                 f"[UPESI] Dynamics obs subset dim: {self.upesi_obs_dyn_dim}/"
@@ -316,23 +331,34 @@ class OnPolicyRunner:
             low, high = high, low
         return [low, high]
 
-    def _get_cdr_max_ranges(self):
+    def _get_cdr_max_ranges_by_key(self):
+        if hasattr(self.env, "get_upesi_cdr_max_ranges"):
+            provided = self.env.get_upesi_cdr_max_ranges()
+            if isinstance(provided, dict):
+                normalized = {}
+                for key, value in provided.items():
+                    normalized[str(key)] = self._to_range_pair(value, [0.0, 0.0])
+                return normalized
+
         max_ranges = getattr(self.env, "domain_rand_max_ranges", None)
         if isinstance(max_ranges, dict):
             friction_range = self._to_range_pair(max_ranges.get("friction_range"), [1.0, 1.0])
             added_mass_range = self._to_range_pair(max_ranges.get("added_mass_range"), [0.0, 0.0])
-            return friction_range, added_mass_range
-
-        cfg_dr = getattr(getattr(self.env, "cfg", None), "domain_rand", None)
-        friction_range = self._to_range_pair(
-            getattr(cfg_dr, "friction_max_range", getattr(cfg_dr, "friction_range", [1.0, 1.0])),
-            [1.0, 1.0],
-        )
-        added_mass_range = self._to_range_pair(
-            getattr(cfg_dr, "added_mass_max_range", getattr(cfg_dr, "added_mass_range", [0.0, 0.0])),
-            [0.0, 0.0],
-        )
-        return friction_range, added_mass_range
+        else:
+            cfg_dr = getattr(getattr(self.env, "cfg", None), "domain_rand", None)
+            friction_range = self._to_range_pair(
+                getattr(cfg_dr, "friction_max_range", getattr(cfg_dr, "friction_range", [1.0, 1.0])),
+                [1.0, 1.0],
+            )
+            added_mass_range = self._to_range_pair(
+                getattr(cfg_dr, "added_mass_max_range", getattr(cfg_dr, "added_mass_range", [0.0, 0.0])),
+                [0.0, 0.0],
+            )
+        return {
+            "added_mass": added_mass_range,
+            "friction_coeff": friction_range,
+            "surface_friction": friction_range,
+        }
 
     def _validate_upesi_theta_bounds_against_cdr(self):
         if not self.upesi_enabled:
@@ -340,41 +366,54 @@ class OnPolicyRunner:
         if not bool(getattr(self.env, "cdr_enabled", False)):
             return
 
-        friction_range, added_mass_range = self._get_cdr_max_ranges()
+        ranges_by_key = self._get_cdr_max_ranges_by_key()
+        if not isinstance(ranges_by_key, dict) or len(ranges_by_key) == 0:
+            return
+
+        missing_keys = [key for key in self.upesi_theta_keys if key not in ranges_by_key]
+        if len(missing_keys) > 0:
+            raise ValueError(
+                "[UPESI/CDR] Missing CDR max ranges for theta keys: "
+                + ", ".join(missing_keys)
+            )
+
         theta_min = self.upesi_theta_min.view(-1)
         theta_max = self.upesi_theta_max.view(-1)
-
-        theta_added_min = float(theta_min[0].item())
-        theta_added_max = float(theta_max[0].item())
-        theta_friction_min = float(theta_min[1].item())
-        theta_friction_max = float(theta_max[1].item())
-
-        covers_added_mass = theta_added_min <= added_mass_range[0] and theta_added_max >= added_mass_range[1]
-        covers_friction = theta_friction_min <= friction_range[0] and theta_friction_max >= friction_range[1]
-        if covers_added_mass and covers_friction:
+        violations = []
+        bounds_eps = 1e-6
+        for idx, key in enumerate(self.upesi_theta_keys):
+            low, high = ranges_by_key[key]
+            key_min = float(theta_min[idx].item())
+            key_max = float(theta_max[idx].item())
+            if key_min > (low + bounds_eps) or key_max < (high - bounds_eps):
+                violations.append(
+                    f"{key}: theta[{key_min}, {key_max}] vs cdr[{low}, {high}]"
+                )
+        if len(violations) == 0:
             return
 
         raise ValueError(
             "[UPESI/CDR] Invalid theta bounds: upesi.theta_min/theta_max must cover CDR max ranges.\n"
             f"  theta keys: {self.upesi_theta_keys}\n"
-            f"  upesi.theta bounds: added_mass[{theta_added_min}, {theta_added_max}], "
-            f"friction[{theta_friction_min}, {theta_friction_max}]\n"
-            f"  CDR max ranges: added_mass[{added_mass_range[0]}, {added_mass_range[1]}], "
-            f"friction[{friction_range[0]}, {friction_range[1]}]"
+            f"  violations: {'; '.join(violations)}"
         )
 
     def _log_startup_summary(self):
         cdr_enabled = bool(getattr(self.env, "cdr_enabled", False))
-        friction_range, added_mass_range = self._get_cdr_max_ranges()
+        cdr_max_ranges_by_key = self._get_cdr_max_ranges_by_key()
         if self.upesi_enabled:
             theta_keys_str = ",".join(self.upesi_theta_keys)
-            theta_bounds_str = (
-                f"[{float(self.upesi_theta_min.view(-1)[0].item()):.4f}, {float(self.upesi_theta_max.view(-1)[0].item()):.4f}] / "
-                f"[{float(self.upesi_theta_min.view(-1)[1].item()):.4f}, {float(self.upesi_theta_max.view(-1)[1].item()):.4f}]"
+            theta_min_list = [float(x) for x in self.upesi_theta_min.view(-1).detach().cpu().tolist()]
+            theta_max_list = [float(x) for x in self.upesi_theta_max.view(-1).detach().cpu().tolist()]
+            theta_bounds_str = f"min={theta_min_list} max={theta_max_list}"
+            cdr_ranges_str = "; ".join(
+                f"{key}:[{value[0]:.4f},{value[1]:.4f}]"
+                for key, value in cdr_max_ranges_by_key.items()
             )
         else:
             theta_keys_str = "n/a"
             theta_bounds_str = "n/a"
+            cdr_ranges_str = "n/a"
 
         print(
             "[Startup] "
@@ -384,10 +423,13 @@ class OnPolicyRunner:
             f"base_dr_only={int(self.cvar_use_base_dr_only)} | "
             f"UPESI enabled={int(self.upesi_enabled)} "
             f"theta_keys={theta_keys_str} "
-            f"theta_bounds(added_mass/friction)={theta_bounds_str} | "
-            f"CDR max added_mass=[{added_mass_range[0]:.4f}, {added_mass_range[1]:.4f}] "
-            f"friction=[{friction_range[0]:.4f}, {friction_range[1]:.4f}]"
+            f"theta_bounds={theta_bounds_str} | "
+            f"CDR max ranges={cdr_ranges_str}"
         )
+        if hasattr(self.env, "get_dof_leg_mapping_summary"):
+            mapping = self.env.get_dof_leg_mapping_summary()
+            if isinstance(mapping, dict) and len(mapping) > 0:
+                print(f"[Startup] DOF-to-leg mapping: {mapping}")
 
     def _get_upesi_theta_norm(self):
         if hasattr(self.env, "get_current_upesi_theta_norm"):
@@ -396,9 +438,20 @@ class OnPolicyRunner:
                 theta_max=self.upesi_theta_max.view(-1),
                 eps=self.upesi_theta_eps,
             )
-            return theta_norm.to(self.device)
+            theta_norm = theta_norm.to(self.device)
+            if theta_norm.shape[-1] != self.upesi_theta_dim:
+                raise ValueError(
+                    f"[UPESI] theta_norm shape mismatch: {tuple(theta_norm.shape)} vs theta_dim={self.upesi_theta_dim}"
+                )
+            if bool(torch.any(torch.isnan(theta_norm)).item()):
+                raise ValueError("[UPESI] theta_norm contains NaN values.")
+            return theta_norm
 
         theta = self.env.get_current_upesi_theta().to(self.device)
+        if theta.shape[-1] != self.upesi_theta_dim:
+            raise ValueError(
+                f"[UPESI] env theta shape mismatch: {tuple(theta.shape)} vs theta_dim={self.upesi_theta_dim}"
+            )
         theta_min = self.upesi_theta_min
         theta_max = self.upesi_theta_max
         theta_norm = 2.0 * (theta - theta_min) / (theta_max - theta_min + self.upesi_theta_eps) - 1.0
@@ -409,10 +462,17 @@ class OnPolicyRunner:
                 f"[UPESI] Warning: theta out of global bounds "
                 f"(warning {self.upesi_out_of_bounds_warning_count}/20)."
             )
+        if bool(torch.any(torch.isnan(theta_norm)).item()):
+            raise ValueError("[UPESI] theta_norm contains NaN values.")
         return theta_norm
 
     def _build_policy_observations(self, obs, critic_obs, theta_norm):
-        alpha = self.upesi_encoder(theta_norm)
+        alpha = self._encode_upesi_alpha(theta_norm)
+        if alpha.shape != (obs.shape[0], self.upesi_embedding_dim):
+            raise ValueError(
+                f"[UPESI] alpha shape mismatch: got {tuple(alpha.shape)}, "
+                f"expected {(obs.shape[0], self.upesi_embedding_dim)}"
+            )
         if self.upesi_detach_encoder_for_ppo:
             alpha_policy = alpha.detach()
         else:
@@ -421,6 +481,10 @@ class OnPolicyRunner:
         obs_policy = torch.cat((obs, alpha_policy), dim=-1)
         critic_obs_policy = torch.cat((critic_obs, alpha_policy), dim=-1)
         return obs_policy, critic_obs_policy
+
+    def _encode_upesi_alpha(self, theta_norm):
+        raw_alpha = self.upesi_encoder(theta_norm)
+        return self.upesi_alpha_scale * torch.tanh(raw_alpha)
 
     def _move_upesi_modules_to_device(self, device):
         if self.upesi_enabled:
@@ -544,7 +608,7 @@ class OnPolicyRunner:
         self.upesi_encoder.to(target_device)
         with torch.inference_mode():
             theta_norm = self._get_upesi_theta_norm().to(target_device)
-            alpha_oracle = self.upesi_encoder(theta_norm)
+            alpha_oracle = self._encode_upesi_alpha(theta_norm)
         return alpha_oracle
 
     def get_oracle_inference_policy(self, device=None):
@@ -562,7 +626,7 @@ class OnPolicyRunner:
                 if device is not None:
                     obs_local = obs_local.to(device)
                 theta_norm = self._get_upesi_theta_norm().to(obs_local.device)
-                alpha = self.upesi_encoder(theta_norm)
+                alpha = self._encode_upesi_alpha(theta_norm)
                 obs_policy = torch.cat((obs_local, alpha), dim=-1)
                 return self.alg.actor_critic.act_inference(obs_policy)
 
@@ -653,7 +717,7 @@ class OnPolicyRunner:
             next_obs_batch = batch["next_obs"]
             theta_norm_batch = batch["theta_norm"]
 
-            alpha = self.upesi_encoder(theta_norm_batch)
+            alpha = self._encode_upesi_alpha(theta_norm_batch)
             model_out = self.upesi_forward_model(obs_batch, actions_batch, alpha)
             if self.upesi_predict_delta_obs:
                 next_obs_hat = obs_batch + model_out
@@ -662,6 +726,11 @@ class OnPolicyRunner:
 
             loss_dyn = self._compute_upesi_dyn_loss(next_obs_hat, next_obs_batch)
             theta_hat_norm = self.upesi_decoder(alpha)
+            if theta_hat_norm.shape != theta_norm_batch.shape:
+                raise ValueError(
+                    f"[UPESI] decoder output shape mismatch: {tuple(theta_hat_norm.shape)} "
+                    f"vs theta batch {tuple(theta_norm_batch.shape)}"
+                )
             loss_rec = torch.mean((theta_hat_norm - theta_norm_batch) ** 2)
             loss_total = loss_dyn + self.upesi_lambda_rec * loss_rec
 
@@ -679,8 +748,13 @@ class OnPolicyRunner:
             for _ in range(self.upesi_identification_steps):
                 batch = self.upesi_buffer.sample_batch(self.upesi_dynamics_batch_size)
                 theta_norm_batch = batch["theta_norm"]
-                alpha = self.upesi_encoder(theta_norm_batch)
+                alpha = self._encode_upesi_alpha(theta_norm_batch)
                 theta_hat_norm = self.upesi_decoder(alpha)
+                if theta_hat_norm.shape != theta_norm_batch.shape:
+                    raise ValueError(
+                        f"[UPESI] decoder output shape mismatch: {tuple(theta_hat_norm.shape)} "
+                        f"vs theta batch {tuple(theta_norm_batch.shape)}"
+                    )
                 loss_ident_step = torch.mean((theta_hat_norm - theta_norm_batch) ** 2)
                 self.upesi_identification_optimizer.zero_grad()
                 loss_ident_step.backward()
@@ -771,6 +845,12 @@ class OnPolicyRunner:
                 obs_stat_min = float("inf")
                 obs_stat_max = float("-inf")
 
+                theta_norm_stat_sum = 0.0
+                theta_norm_stat_sumsq = 0.0
+                theta_norm_stat_count = 0
+                theta_norm_stat_min = float("inf")
+                theta_norm_stat_max = float("-inf")
+
                 alpha_stat_sum = 0.0
                 alpha_stat_sumsq = 0.0
                 alpha_stat_count = 0
@@ -787,12 +867,18 @@ class OnPolicyRunner:
                         obs_policy, critic_obs_policy = self._build_policy_observations(obs, critic_obs, theta_norm)
                         alpha_policy = obs_policy[:, self.base_actor_obs_dim:]
                         obs_flat = obs.reshape(-1)
+                        theta_norm_flat = theta_norm.reshape(-1)
                         alpha_flat = alpha_policy.reshape(-1)
                         obs_stat_sum += float(obs_flat.sum().item())
                         obs_stat_sumsq += float((obs_flat * obs_flat).sum().item())
                         obs_stat_count += int(obs_flat.numel())
                         obs_stat_min = min(obs_stat_min, float(obs_flat.min().item()))
                         obs_stat_max = max(obs_stat_max, float(obs_flat.max().item()))
+                        theta_norm_stat_sum += float(theta_norm_flat.sum().item())
+                        theta_norm_stat_sumsq += float((theta_norm_flat * theta_norm_flat).sum().item())
+                        theta_norm_stat_count += int(theta_norm_flat.numel())
+                        theta_norm_stat_min = min(theta_norm_stat_min, float(theta_norm_flat.min().item()))
+                        theta_norm_stat_max = max(theta_norm_stat_max, float(theta_norm_flat.max().item()))
                         alpha_stat_sum += float(alpha_flat.sum().item())
                         alpha_stat_sumsq += float((alpha_flat * alpha_flat).sum().item())
                         alpha_stat_count += int(alpha_flat.numel())
@@ -877,10 +963,16 @@ class OnPolicyRunner:
                 else:
                     self.alg.compute_returns(critic_obs)
 
-            if self.upesi_enabled and obs_stat_count > 0 and alpha_stat_count > 0:
+            if self.upesi_enabled and obs_stat_count > 0 and alpha_stat_count > 0 and theta_norm_stat_count > 0:
                 obs_mean = obs_stat_sum / float(obs_stat_count)
                 obs_var = max(obs_stat_sumsq / float(obs_stat_count) - obs_mean * obs_mean, 0.0)
                 obs_std = obs_var ** 0.5
+                theta_norm_mean = theta_norm_stat_sum / float(theta_norm_stat_count)
+                theta_norm_var = max(
+                    theta_norm_stat_sumsq / float(theta_norm_stat_count) - theta_norm_mean * theta_norm_mean,
+                    0.0,
+                )
+                theta_norm_std = theta_norm_var ** 0.5
                 alpha_mean = alpha_stat_sum / float(alpha_stat_count)
                 alpha_var = max(alpha_stat_sumsq / float(alpha_stat_count) - alpha_mean * alpha_mean, 0.0)
                 alpha_std = alpha_var ** 0.5
@@ -890,6 +982,10 @@ class OnPolicyRunner:
                     "obs_std": obs_std,
                     "obs_min": obs_stat_min,
                     "obs_max": obs_stat_max,
+                    "theta_norm_mean": theta_norm_mean,
+                    "theta_norm_std": theta_norm_std,
+                    "theta_norm_min": theta_norm_stat_min,
+                    "theta_norm_max": theta_norm_stat_max,
                     "alpha_mean": alpha_mean,
                     "alpha_std": alpha_std,
                     "alpha_min": alpha_stat_min,
@@ -998,8 +1094,15 @@ class OnPolicyRunner:
         if upesi_scale_stats is not None and self.upesi_enabled:
             ep_string += f"""{'UPESI obs_mean:':>{pad}} {upesi_scale_stats['obs_mean']:.6f}\n"""
             ep_string += f"""{'UPESI obs_std:':>{pad}} {upesi_scale_stats['obs_std']:.6f}\n"""
+            ep_string += f"""{'UPESI theta_norm_mean:':>{pad}} {upesi_scale_stats['theta_norm_mean']:.6f}\n"""
+            ep_string += f"""{'UPESI theta_norm_std:':>{pad}} {upesi_scale_stats['theta_norm_std']:.6f}\n"""
+            ep_string += f"""{'UPESI theta_norm_min:':>{pad}} {upesi_scale_stats['theta_norm_min']:.6f}\n"""
+            ep_string += f"""{'UPESI theta_norm_max:':>{pad}} {upesi_scale_stats['theta_norm_max']:.6f}\n"""
             ep_string += f"""{'UPESI alpha_mean:':>{pad}} {upesi_scale_stats['alpha_mean']:.6f}\n"""
             ep_string += f"""{'UPESI alpha_std:':>{pad}} {upesi_scale_stats['alpha_std']:.6f}\n"""
+            ep_string += f"""{'UPESI alpha_min:':>{pad}} {upesi_scale_stats['alpha_min']:.6f}\n"""
+            ep_string += f"""{'UPESI alpha_max:':>{pad}} {upesi_scale_stats['alpha_max']:.6f}\n"""
+            ep_string += f"""{'UPESI alpha_norm:':>{pad}} {upesi_scale_stats['alpha_norm']:.6f}\n"""
 
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
@@ -1033,6 +1136,16 @@ class OnPolicyRunner:
                 self.writer.add_scalar('upesi/loss_rec', upesi_stats["loss_rec"], locs['it'])
             if upesi_stats.get("loss_total", None) is not None:
                 self.writer.add_scalar('upesi/loss_total', upesi_stats["loss_total"], locs['it'])
+        if upesi_scale_stats is not None and self.upesi_enabled:
+            self.writer.add_scalar('UPESI/theta_norm_mean', upesi_scale_stats['theta_norm_mean'], locs['it'])
+            self.writer.add_scalar('UPESI/theta_norm_std', upesi_scale_stats['theta_norm_std'], locs['it'])
+            self.writer.add_scalar('UPESI/theta_norm_min', upesi_scale_stats['theta_norm_min'], locs['it'])
+            self.writer.add_scalar('UPESI/theta_norm_max', upesi_scale_stats['theta_norm_max'], locs['it'])
+            self.writer.add_scalar('UPESI/alpha_mean', upesi_scale_stats['alpha_mean'], locs['it'])
+            self.writer.add_scalar('UPESI/alpha_std', upesi_scale_stats['alpha_std'], locs['it'])
+            self.writer.add_scalar('UPESI/alpha_min', upesi_scale_stats['alpha_min'], locs['it'])
+            self.writer.add_scalar('UPESI/alpha_max', upesi_scale_stats['alpha_max'], locs['it'])
+            self.writer.add_scalar('UPESI/alpha_norm', upesi_scale_stats['alpha_norm'], locs['it'])
 
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
@@ -1064,15 +1177,13 @@ class OnPolicyRunner:
         log_string += ep_string
         if hasattr(self.env, "domain_rand_current_ranges"):
             ranges = self.env.domain_rand_current_ranges
-            friction_range = ranges["friction_range"]
-            added_mass_range = ranges["added_mass_range"]
-            push_vel_xy_range = ranges["push_vel_xy_range"]
-            log_string += (
-                f"""{'CDR ranges:':>{pad}} """
-                f"""friction[{friction_range[0]:.2f}, {friction_range[1]:.2f}] """
-                f"""added_mass[{added_mass_range[0]:.2f}, {added_mass_range[1]:.2f}] """
-                f"""push_vel_xy[{push_vel_xy_range[0]:.2f}, {push_vel_xy_range[1]:.2f}]\n"""
-            )
+            range_chunks = []
+            for key in sorted(ranges.keys()):
+                value = ranges[key]
+                if isinstance(value, (list, tuple)) and len(value) >= 2:
+                    range_chunks.append(f"{key}[{float(value[0]):.2f},{float(value[1]):.2f}]")
+            if len(range_chunks) > 0:
+                log_string += f"""{'CDR ranges:':>{pad}} """ + " ".join(range_chunks) + "\n"
         log_string += (f"""{'-' * width}\n"""
                        f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
                        f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""

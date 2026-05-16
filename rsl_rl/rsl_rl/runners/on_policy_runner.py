@@ -105,6 +105,14 @@ class OnPolicyRunner:
             self.upesi_alpha_scale = float(self.upesi_cfg.get("alpha_scale", 1.0))
             if self.upesi_alpha_scale <= 0.0:
                 raise ValueError(f"UPESI alpha_scale must be > 0, got {self.upesi_alpha_scale}")
+            self.upesi_policy_alpha_input_scale = float(
+                self.upesi_cfg.get("policy_alpha_input_scale", 1.0)
+            )
+            if self.upesi_policy_alpha_input_scale <= 0.0:
+                raise ValueError(
+                    "UPESI policy_alpha_input_scale must be > 0, "
+                    f"got {self.upesi_policy_alpha_input_scale}"
+                )
             self.upesi_detach_encoder_for_ppo = bool(self.upesi_cfg.get("detach_encoder_for_ppo", True))
             self.upesi_predict_delta_obs = bool(self.upesi_cfg.get("predict_delta_obs", True))
             self.upesi_dynamics_include_base_lin_vel = bool(
@@ -406,6 +414,7 @@ class OnPolicyRunner:
             theta_min_list = [float(x) for x in self.upesi_theta_min.view(-1).detach().cpu().tolist()]
             theta_max_list = [float(x) for x in self.upesi_theta_max.view(-1).detach().cpu().tolist()]
             theta_bounds_str = f"min={theta_min_list} max={theta_max_list}"
+            policy_alpha_input_scale_str = f"{float(self.upesi_policy_alpha_input_scale):.4f}"
             cdr_ranges_str = "; ".join(
                 f"{key}:[{value[0]:.4f},{value[1]:.4f}]"
                 for key, value in cdr_max_ranges_by_key.items()
@@ -413,6 +422,7 @@ class OnPolicyRunner:
         else:
             theta_keys_str = "n/a"
             theta_bounds_str = "n/a"
+            policy_alpha_input_scale_str = "n/a"
             cdr_ranges_str = "n/a"
 
         print(
@@ -422,6 +432,7 @@ class OnPolicyRunner:
             f"tail_weight={float(getattr(self.alg, 'cvar_tail_weight', 1.0)):.4f} "
             f"base_dr_only={int(self.cvar_use_base_dr_only)} | "
             f"UPESI enabled={int(self.upesi_enabled)} "
+            f"policy_alpha_input_scale={policy_alpha_input_scale_str} "
             f"theta_keys={theta_keys_str} "
             f"theta_bounds={theta_bounds_str} | "
             f"CDR max ranges={cdr_ranges_str}"
@@ -478,13 +489,17 @@ class OnPolicyRunner:
         else:
             alpha_policy = alpha
 
-        obs_policy = torch.cat((obs, alpha_policy), dim=-1)
-        critic_obs_policy = torch.cat((critic_obs, alpha_policy), dim=-1)
+        alpha_policy_scaled = self._scale_alpha_for_policy_input(alpha_policy)
+        obs_policy = torch.cat((obs, alpha_policy_scaled), dim=-1)
+        critic_obs_policy = torch.cat((critic_obs, alpha_policy_scaled), dim=-1)
         return obs_policy, critic_obs_policy
 
     def _encode_upesi_alpha(self, theta_norm):
         raw_alpha = self.upesi_encoder(theta_norm)
         return self.upesi_alpha_scale * torch.tanh(raw_alpha)
+
+    def _scale_alpha_for_policy_input(self, alpha):
+        return alpha * self.upesi_policy_alpha_input_scale
 
     def _move_upesi_modules_to_device(self, device):
         if self.upesi_enabled:
@@ -627,7 +642,8 @@ class OnPolicyRunner:
                     obs_local = obs_local.to(device)
                 theta_norm = self._get_upesi_theta_norm().to(obs_local.device)
                 alpha = self._encode_upesi_alpha(theta_norm)
-                obs_policy = torch.cat((obs_local, alpha), dim=-1)
+                alpha_policy = self._scale_alpha_for_policy_input(alpha)
+                obs_policy = torch.cat((obs_local, alpha_policy), dim=-1)
                 return self.alg.actor_critic.act_inference(obs_policy)
 
         return _policy
@@ -667,7 +683,8 @@ class OnPolicyRunner:
                 if device is not None:
                     obs_local = obs_local.to(device)
                 alpha_batch = alpha_star.expand(obs_local.shape[0], -1)
-                obs_policy = torch.cat((obs_local, alpha_batch), dim=-1)
+                alpha_policy = self._scale_alpha_for_policy_input(alpha_batch)
+                obs_policy = torch.cat((obs_local, alpha_policy), dim=-1)
                 return self.alg.actor_critic.act_inference(obs_policy)
 
         if return_diagnostics:
@@ -1000,6 +1017,11 @@ class OnPolicyRunner:
             learn_time = stop - start
 
             curriculum_metrics = self._collect_curriculum_metrics(ep_infos, it)
+            if upesi_stats is not None:
+                for metric_name in ("loss_dyn", "loss_rec", "loss_total", "loss_ident"):
+                    metric_value = upesi_stats.get(metric_name, None)
+                    if metric_value is not None:
+                        curriculum_metrics[f"upesi_{metric_name}"] = float(metric_value)
             curriculum_info = None
             if hasattr(self.env, "update_curriculum"):
                 curriculum_info = self.env.update_curriculum(curriculum_metrics)
@@ -1060,6 +1082,19 @@ class OnPolicyRunner:
                 ep_string += f"""{'CDR window success_rate:':>{pad}} {success_rate_window:.4f}\n"""
             if curriculum_info.get("updated", None) is not None:
                 ep_string += f"""{'CDR updated this iter:':>{pad}} {1 if curriculum_info.get('updated', False) else 0}\n"""
+            if curriculum_info.get("upesi_gate_enabled", False):
+                gate_metric = curriculum_info.get("upesi_gate_metric_window", None)
+                gate_ewma = curriculum_info.get("upesi_gate_metric_ewma", None)
+                gate_threshold = curriculum_info.get("upesi_gate_threshold", None)
+                gate_metric_str = "nan" if gate_metric is None else f"{gate_metric:.6f}"
+                gate_ewma_str = "nan" if gate_ewma is None else f"{gate_ewma:.6f}"
+                gate_threshold_str = "nan" if gate_threshold is None else f"{gate_threshold:.6f}"
+                ep_string += f"""{'CDR UPESI gate passed:':>{pad}} {1 if curriculum_info.get('upesi_gate_passed', False) else 0}\n"""
+                ep_string += f"""{'CDR UPESI gate reason:':>{pad}} {curriculum_info.get('upesi_gate_reason', 'n/a')}\n"""
+                ep_string += f"""{'CDR gate loss_ident(win):':>{pad}} {gate_metric_str}\n"""
+                ep_string += f"""{'CDR gate loss_ident(ewma):':>{pad}} {gate_ewma_str}\n"""
+                ep_string += f"""{'CDR gate threshold:':>{pad}} {gate_threshold_str}\n"""
+                ep_string += f"""{'CDR gate cooldown:':>{pad}} {int(curriculum_info.get('upesi_gate_cooldown_counter', 0))}\n"""
 
         if cvar_stats is not None:
             threshold = cvar_stats.get("tail_threshold_return", None)

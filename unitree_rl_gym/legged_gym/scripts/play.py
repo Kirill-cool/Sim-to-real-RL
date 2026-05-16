@@ -506,54 +506,169 @@ def _configure_upesi_eval_hard_domain(env):
             return _to_range_pair(current[key], fallback)
         return _to_range_pair(fallback, fallback)
 
+    # Extreme-hard preset for eval:
+    # keep parameters near adversarial edges of their max ranges.
     hard_ranges = {}
+    hard_per_leg_ranges = {}
     if "added_mass_range" in current or "added_mass_range" in max_ranges:
         hard_ranges["added_mass_range"] = _biased_subrange(
             _get_range("added_mass_range", [0.0, 0.0]),
-            bias="full",
-            hardness=1.0,
+            bias="high",
+            hardness=0.1,
         )
     if "friction_range" in current or "friction_range" in max_ranges:
         hard_ranges["friction_range"] = _biased_subrange(
             _get_range("friction_range", [1.0, 1.0]),
             bias="low",
-            hardness=0.5,
+            hardness=0.05,
         )
     if "motor_strength_range" in current or "motor_strength_range" in max_ranges:
+        motor_base = _get_range("motor_strength_range", [1.0, 1.0])
         hard_ranges["motor_strength_range"] = _biased_subrange(
-            _get_range("motor_strength_range", [1.0, 1.0]),
+            motor_base,
+            bias="full",
+            hardness=1.0,
+        )
+        motor_low = _biased_subrange(
+            motor_base,
             bias="low",
-            hardness=0.5,
+            hardness=0.02,
         )
+        motor_high = _biased_subrange(
+            motor_base,
+            bias="high",
+            hardness=0.02,
+        )
+        hard_per_leg_ranges["motor_strength_range_per_leg"] = {
+            "FL": list(motor_low),
+            "FR": list(motor_high),
+            "RL": list(motor_high),
+            "RR": list(motor_low),
+        }
     if "joint_damping_range" in current or "joint_damping_range" in max_ranges:
+        joint_base = _get_range("joint_damping_range", [1.0, 1.0])
         hard_ranges["joint_damping_range"] = _biased_subrange(
-            _get_range("joint_damping_range", [1.0, 1.0]),
-            bias="high",
-            hardness=0.5,
+            joint_base,
+            bias="full",
+            hardness=1.0,
         )
-    if "static_joint_friction_range" in current or "static_joint_friction_range" in max_ranges:
-        hard_ranges["static_joint_friction_range"] = _biased_subrange(
-            _get_range("static_joint_friction_range", [0.0, 0.0]),
+        joint_low = _biased_subrange(
+            joint_base,
+            bias="low",
+            hardness=0.02,
+        )
+        joint_high = _biased_subrange(
+            joint_base,
             bias="high",
-            hardness=0.5,
+            hardness=0.02,
+        )
+        hard_per_leg_ranges["joint_damping_range_per_leg"] = {
+            "FL": list(joint_high),
+            "FR": list(joint_low),
+            "RL": list(joint_low),
+            "RR": list(joint_high),
+        }
+    if "static_joint_friction_range" in current or "static_joint_friction_range" in max_ranges:
+        static_base = _get_range("static_joint_friction_range", [0.0, 0.0])
+        hard_ranges["static_joint_friction_range"] = _biased_subrange(
+            static_base,
+            bias="full",
+            hardness=1.0,
+        )
+        static_low = _biased_subrange(
+            static_base,
+            bias="low",
+            hardness=0.02,
+        )
+        static_high = _biased_subrange(
+            static_base,
+            bias="high",
+            hardness=0.02,
+        )
+        hard_per_leg_ranges["static_joint_friction_range_per_leg"] = {
+            "FL": list(static_high),
+            "FR": list(static_low),
+            "RL": list(static_low),
+            "RR": list(static_high),
+        }
+    if "push_vel_xy_range" in current or "push_vel_xy_range" in max_ranges:
+        hard_ranges["push_vel_xy_range"] = _biased_subrange(
+            _get_range("push_vel_xy_range", [0.0, 0.0]),
+            bias="high",
+            hardness=0.1,
         )
 
-    # Keep observation noise unchanged by default, unless the task explicitly wants to expand it.
-    if "observation_noise_range" in current:
-        hard_ranges["observation_noise_range"] = _to_range_pair(
-            current["observation_noise_range"],
-            [1.0, 1.0],
+    if "observation_noise_range" in current or "observation_noise_range" in max_ranges:
+        hard_ranges["observation_noise_range"] = _biased_subrange(
+            _get_range("observation_noise_range", [1.0, 1.0]),
+            bias="high",
+            hardness=0.05,
         )
 
     for key, value in hard_ranges.items():
         current[key] = list(value)
+    for key, value in hard_per_leg_ranges.items():
+        current[key] = dict(value)
 
     cfg_dr = getattr(getattr(env, "cfg", None), "domain_rand", None)
     if cfg_dr is not None:
         for key, value in hard_ranges.items():
             if hasattr(cfg_dr, key):
                 setattr(cfg_dr, key, list(value))
+    if len(hard_per_leg_ranges) > 0:
+        per_leg_str_parts = []
+        for range_key, mapping in hard_per_leg_ranges.items():
+            leg_str = ", ".join(
+                f"{leg}:[{float(bounds[0]):.4f},{float(bounds[1]):.4f}]"
+                for leg, bounds in mapping.items()
+            )
+            per_leg_str_parts.append(f"{range_key} -> {leg_str}")
+        print("[UPESI Eval] hard-domain per-leg ranges: " + " | ".join(per_leg_str_parts))
     return hard_ranges
+
+
+def _configure_eval_max_domain_ranges(env):
+    if not hasattr(env, "domain_rand_current_ranges"):
+        return {}
+    current = getattr(env, "domain_rand_current_ranges", None)
+    max_ranges = getattr(env, "domain_rand_max_ranges", None)
+    if not isinstance(current, dict) or not isinstance(max_ranges, dict) or len(max_ranges) == 0:
+        return {}
+
+    # For CDR-based tasks, force evaluation at curriculum maximum first.
+    if bool(getattr(env, "cdr_enabled", False)) and hasattr(env, "set_curriculum_level"):
+        try:
+            env.set_curriculum_level(float(getattr(env, "cdr_max_level", 1.0)))
+            current = getattr(env, "domain_rand_current_ranges", current)
+        except Exception:
+            pass
+
+    applied = {}
+    for key, value in max_ranges.items():
+        pair = _to_range_pair(value, [0.0, 0.0])
+        current[key] = list(pair)
+        applied[key] = list(pair)
+
+    # Ensure no per-leg hard overrides leak when hard-domain is disabled.
+    for key in [
+        "motor_strength_range_per_leg",
+        "joint_damping_range_per_leg",
+        "static_joint_friction_range_per_leg",
+    ]:
+        if key in current:
+            current.pop(key, None)
+
+    cfg_dr = getattr(getattr(env, "cfg", None), "domain_rand", None)
+    if cfg_dr is not None:
+        for key, value in applied.items():
+            if hasattr(cfg_dr, key):
+                setattr(cfg_dr, key, list(value))
+        if "push_vel_xy_range" in applied:
+            push_low, push_high = applied["push_vel_xy_range"]
+            if hasattr(cfg_dr, "max_push_vel_xy"):
+                cfg_dr.max_push_vel_xy = max(abs(float(push_low)), abs(float(push_high)))
+
+    return applied
 
 
 def _log_upesi_theta_stats(env, label):
@@ -582,8 +697,8 @@ def _log_upesi_theta_stats(env, label):
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # Play-only manual heading overrides (edit directly here; no CLI flags required).
-    manual_heading_command = False   # None | True | False
-    manual_heading_target_rad = 0.0  # None | float (e.g. 0.0)
+    manual_heading_command = None   # None | True | False
+    manual_heading_target_rad = (0.0)  # None | float (e.g. 0.0)
     # Keep explicit play overrides, but set them equal to task/train config values.
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 100)
     env_cfg.terrain.num_rows = 5
@@ -591,11 +706,11 @@ def play(args):
     env_cfg.terrain.curriculum = env_cfg.terrain.curriculum
     env_cfg.noise.add_noise = env_cfg.noise.add_noise
     env_cfg.domain_rand.randomize_friction = env_cfg.domain_rand.randomize_friction
-    env_cfg.domain_rand.push_robots = env_cfg.domain_rand.push_robots
+    env_cfg.domain_rand.push_robots = True
     env_cfg.commands.curriculum = env_cfg.commands.curriculum
-    env_cfg.commands.ranges.lin_vel_x = [0.7, 0.7]
-    env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
-    env_cfg.commands.ranges.ang_vel_yaw = [0.0, 0.0]
+    env_cfg.commands.ranges.lin_vel_x = [-1.0, 1.0]
+    env_cfg.commands.ranges.lin_vel_y = [-1.0, 1.0]
+    env_cfg.commands.ranges.ang_vel_yaw = [-1.0, 1.0]
 
     if manual_heading_command is not None:
         env_cfg.commands.heading_command = bool(manual_heading_command)
@@ -629,8 +744,15 @@ def play(args):
         )
     hard_domain_flag = _parse_optional_bool(getattr(args, "upesi_eval_hard_domain", None))
     hard_domain_enabled = bool(hard_domain_flag) if hard_domain_flag is not None else False
+    max_ranges = _configure_eval_max_domain_ranges(env)
+    if len(max_ranges) > 0:
+        max_ranges_pretty = " | ".join(
+            f"{k}[{float(v[0]):.4f},{float(v[1]):.4f}]"
+            for k, v in max_ranges.items()
+        )
+        print(f"[Eval] max-domain ranges: {max_ranges_pretty}")
     print(f"UPESI eval hard domain: {hard_domain_enabled}")
-    if hard_domain_enabled and upesi_eval_mode in {"oracle", "identified", "online_identified"}:
+    if hard_domain_enabled:
         hard_ranges = _configure_upesi_eval_hard_domain(env)
         if len(hard_ranges) > 0:
             hard_ranges_pretty = " | ".join(
@@ -640,7 +762,8 @@ def play(args):
             print(f"[UPESI Eval] hard-domain ranges: {hard_ranges_pretty}")
         else:
             print("[UPESI Eval] hard-domain ranges: n/a (env does not expose domain_rand_current_ranges)")
-        obs, _ = env.reset()
+    obs, _ = env.reset()
+    if hard_domain_enabled:
         _log_upesi_theta_stats(env, label="post-hard-reset")
 
     upesi_cfg_for_eval = getattr(ppo_runner, "upesi_cfg", {})
@@ -671,11 +794,29 @@ def play(args):
 
     if upesi_eval_mode == "standard":
         policy = ppo_runner.get_inference_policy(device=env.device)
-        for step_idx in range(1, eval_steps + 1):
-            actions = policy(obs.detach())
-            actions = _apply_eval_startup_phase(env, actions, step_idx, startup_cfg=eval_startup_cfg)
-            obs, _, _, dones, _ = env.step(actions.detach())
-            _log_eval_early_termination(env, dones, step_idx, eval_steps, mode_label="standard")
+        standard_eval = _run_eval_rollout(
+            env,
+            policy,
+            obs,
+            eval_steps,
+            startup_cfg=eval_startup_cfg,
+            mode_label="standard",
+        )
+        _print_upesi_eval_block(
+            "standard",
+            {
+                "standard_return": standard_eval["return"],
+                "standard_episode_length": standard_eval["episode_length"],
+                "standard_episodes_finished": standard_eval["episodes_finished"],
+                "standard_fall_rate": standard_eval["fall_rate"],
+                "standard_timeout_rate": standard_eval["timeout_rate"],
+                "standard_contact_termination_rate": standard_eval["contact_termination_rate"],
+                "standard_orientation_termination_rate": standard_eval["orientation_termination_rate"],
+                "standard_non_timeout_termination_rate": standard_eval["non_timeout_termination_rate"],
+                "standard_tracking_error": standard_eval["tracking_error"],
+                "standard_eval_steps": float(eval_steps),
+            },
+        )
     elif upesi_eval_mode == "oracle":
         upesi_cfg = getattr(ppo_runner, "upesi_cfg", {})
         oracle_eval_steps = int(eval_steps)
@@ -866,6 +1007,11 @@ def play(args):
         if not np.isfinite(online_identify_accept_ratio) or online_identify_accept_ratio <= 0.0:
             online_identify_accept_ratio = 0.998
         online_save_final_alpha = bool(upesi_cfg.get("online_save_final_alpha", False))
+        policy_alpha_input_scale = float(getattr(ppo_runner, "upesi_policy_alpha_input_scale", 1.0))
+        if policy_alpha_input_scale <= 0.0:
+            raise ValueError(
+                f"UPESI policy_alpha_input_scale must be > 0, got {policy_alpha_input_scale}"
+            )
         identification_steps = getattr(args, "upesi_identification_steps", None)
         identification_lr = getattr(args, "upesi_identification_lr", None)
 
@@ -935,7 +1081,10 @@ def play(args):
 
             with torch.inference_mode():
                 alpha_batch = alpha_current.view(1, -1).expand(obs.shape[0], -1)
-                obs_for_policy = torch.cat((obs.detach(), alpha_batch), dim=-1)
+                obs_for_policy = torch.cat(
+                    (obs.detach(), policy_alpha_input_scale * alpha_batch),
+                    dim=-1,
+                )
                 actions = ppo_runner.alg.actor_critic.act_inference(obs_for_policy)
                 actions = _apply_eval_startup_phase(env, actions, step_idx, startup_cfg=eval_startup_cfg)
                 next_obs, _, rews, dones, infos = env.step(actions.detach())

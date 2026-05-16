@@ -231,8 +231,7 @@ class LeggedRobot(BaseTask):
                                     self.dof_vel * self.obs_scales.dof_vel,
                                     self.actions
                                     ),dim=-1)
-        # add perceptive inputs if not blind
-        # add noise if needed
+
         if self.add_noise:
             self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
 
@@ -877,6 +876,40 @@ class LeggedRobot(BaseTask):
         except (TypeError, ValueError):
             return None
 
+    def _init_cdr_upesi_gate_state(self, cdr_cfg):
+        self.cdr_upesi_gate_enabled = (
+            bool(getattr(cdr_cfg, "upesi_gate_enabled", False)) if cdr_cfg is not None else False
+        )
+        self.cdr_upesi_gate_metric_key = (
+            str(getattr(cdr_cfg, "upesi_gate_metric", "upesi_loss_ident"))
+            if cdr_cfg is not None
+            else "upesi_loss_ident"
+        )
+        self.cdr_upesi_gate_ewma_beta = (
+            float(getattr(cdr_cfg, "upesi_gate_ewma_beta", 0.8)) if cdr_cfg is not None else 0.8
+        )
+        self.cdr_upesi_gate_ewma_beta = float(np.clip(self.cdr_upesi_gate_ewma_beta, 0.0, 0.9999))
+        self.cdr_upesi_gate_delta_max = (
+            float(getattr(cdr_cfg, "upesi_gate_delta_max", 0.05)) if cdr_cfg is not None else 0.05
+        )
+        self.cdr_upesi_gate_abs_min = (
+            float(getattr(cdr_cfg, "upesi_gate_abs_min", 0.0012)) if cdr_cfg is not None else 0.0012
+        )
+        self.cdr_upesi_gate_ref_multiplier = (
+            float(getattr(cdr_cfg, "upesi_gate_ref_multiplier", 1.8)) if cdr_cfg is not None else 1.8
+        )
+        self.cdr_upesi_gate_ref_windows = (
+            max(1, int(getattr(cdr_cfg, "upesi_gate_ref_windows", 5))) if cdr_cfg is not None else 5
+        )
+        self.cdr_upesi_gate_cooldown_windows = (
+            max(0, int(getattr(cdr_cfg, "upesi_gate_cooldown_windows", 2))) if cdr_cfg is not None else 2
+        )
+        self.cdr_upesi_gate_cooldown_counter = 0
+        self.cdr_upesi_gate_ref_values = []
+        self.cdr_upesi_gate_ref = None
+        self.cdr_upesi_gate_metric_ewma = None
+        self.cdr_upesi_gate_metric_ewma_prev = None
+
     def update_curriculum(self, metrics_dict):
         info = {
             "updated": False,
@@ -933,9 +966,72 @@ class LeggedRobot(BaseTask):
         info["mean_reward"] = avg_reward
         info["tracking_reward"] = tracking_reward
 
+        gate_passed = True
+        gate_reason = "disabled"
+        gate_metric_window = None
+        gate_metric_ewma = self.cdr_upesi_gate_metric_ewma
+        gate_metric_delta = 0.0
+        gate_threshold = None
+        if self.cdr_upesi_gate_enabled:
+            gate_reason = "ok"
+            if self.cdr_upesi_gate_cooldown_counter > 0:
+                self.cdr_upesi_gate_cooldown_counter -= 1
+                gate_passed = False
+                gate_reason = "cooldown"
+            gate_metric_window = weighted_mean(self.cdr_upesi_gate_metric_key)
+            if gate_metric_window is None:
+                gate_passed = False
+                gate_reason = "metric_missing"
+            else:
+                beta = self.cdr_upesi_gate_ewma_beta
+                prev_ewma = self.cdr_upesi_gate_metric_ewma
+                if prev_ewma is None:
+                    curr_ewma = float(gate_metric_window)
+                else:
+                    curr_ewma = float(beta * prev_ewma + (1.0 - beta) * float(gate_metric_window))
+                self.cdr_upesi_gate_metric_ewma_prev = prev_ewma
+                self.cdr_upesi_gate_metric_ewma = curr_ewma
+                gate_metric_ewma = curr_ewma
+                if prev_ewma is not None:
+                    gate_metric_delta = (curr_ewma - prev_ewma) / max(abs(prev_ewma), 1.0e-8)
+                else:
+                    gate_metric_delta = 0.0
+
+                if self.cdr_upesi_gate_ref is None:
+                    self.cdr_upesi_gate_ref_values.append(float(gate_metric_window))
+                    if len(self.cdr_upesi_gate_ref_values) >= self.cdr_upesi_gate_ref_windows:
+                        self.cdr_upesi_gate_ref = float(np.median(self.cdr_upesi_gate_ref_values))
+                    else:
+                        gate_passed = False
+                        gate_reason = "ref_warmup"
+                if self.cdr_upesi_gate_ref is not None:
+                    gate_threshold = max(
+                        self.cdr_upesi_gate_ref_multiplier * self.cdr_upesi_gate_ref,
+                        self.cdr_upesi_gate_abs_min,
+                    )
+                    if curr_ewma > gate_threshold:
+                        gate_passed = False
+                        gate_reason = "ewma_above_threshold"
+                    elif gate_metric_delta > self.cdr_upesi_gate_delta_max:
+                        gate_passed = False
+                        gate_reason = "ewma_growth"
+
+        info["upesi_gate_enabled"] = bool(self.cdr_upesi_gate_enabled)
+        info["upesi_gate_passed"] = bool(gate_passed)
+        info["upesi_gate_reason"] = gate_reason
+        info["upesi_gate_metric_key"] = self.cdr_upesi_gate_metric_key
+        info["upesi_gate_metric_window"] = gate_metric_window
+        info["upesi_gate_metric_ewma"] = gate_metric_ewma
+        info["upesi_gate_metric_delta"] = gate_metric_delta
+        info["upesi_gate_threshold"] = gate_threshold
+        info["upesi_gate_ref"] = self.cdr_upesi_gate_ref
+        info["upesi_gate_cooldown_counter"] = int(self.cdr_upesi_gate_cooldown_counter)
+
         if num_episodes < self.cdr_min_episodes_for_update:
             return info
         if success_rate is None or success_rate <= self.cdr_success_threshold:
+            return info
+        if self.cdr_upesi_gate_enabled and not gate_passed:
             return info
 
         previous_level = self.get_curriculum_level()
@@ -950,13 +1046,17 @@ class LeggedRobot(BaseTask):
             target_level = float(np.clip(stage_reset_level, 0.0, self.cdr_max_level))
 
         self.set_curriculum_level(target_level)
+        updated_now = stage_advanced or (abs(self.get_curriculum_level() - previous_level) > 1e-8)
+        if updated_now and self.cdr_upesi_gate_enabled:
+            self.cdr_upesi_gate_cooldown_counter = int(self.cdr_upesi_gate_cooldown_windows)
 
-        info["updated"] = stage_advanced or (abs(self.get_curriculum_level() - previous_level) > 1e-8)
+        info["updated"] = updated_now
         info["stage_advanced"] = stage_advanced
         info["previous_level"] = previous_level
         info["previous_stage"] = previous_stage
         info["level"] = self.get_curriculum_level()
         info["stage"] = int(self.cdr_stage_idx)
+        info["upesi_gate_cooldown_counter"] = int(self.cdr_upesi_gate_cooldown_counter)
         info["friction_range"] = self.domain_rand_current_ranges["friction_range"]
         info["added_mass_range"] = self.domain_rand_current_ranges["added_mass_range"]
         info["push_vel_xy_range"] = self.domain_rand_current_ranges["push_vel_xy_range"]
@@ -976,6 +1076,7 @@ class LeggedRobot(BaseTask):
         self.cdr_stage_idx = 0
         self.cdr_metrics_window = deque(maxlen=self.cdr_update_interval)
         self.cdr_iteration_counter = 0
+        self._init_cdr_upesi_gate_state(cdr_cfg)
 
         if self.cdr_enabled:
             self.cdr_level = float(np.clip(initial_level, 0.0, self.cdr_max_level))

@@ -46,31 +46,32 @@ class GO2RoughCfg( LeggedRobotCfg ):
         friction_max_range = [0.5, 1.25]
 
         randomize_base_mass = True
-        added_mass_range = [-1., 1.]
+        # Baseline PPO+DR should train on full CDR-maximum ranges for fair comparison.
+        added_mass_range = [-2., 2.]
         added_mass_nominal = 0.0
         added_mass_max_range = [-2., 2.]
 
         push_robots = False
         push_interval_s = 15
-        max_push_vel_xy = 1.
+        max_push_vel_xy = 2.
         push_vel_xy_nominal = 0.0
         push_vel_xy_max_range = [-1., 1.]
 
-        motor_strength_range = [0.95, 1.05]
+        motor_strength_range = [0.8, 1.2]
         motor_strength_nominal = 1.0
         motor_strength_max_range = [0.8, 1.2]
 
-        joint_damping_range = [0.9, 1.1]
+        joint_damping_range = [0.5, 1.5]
         joint_damping_nominal = 1.0
         joint_damping_max_range = [0.5, 1.5]
 
         # Torque-like Coulomb friction magnitude per joint, applied via tanh(v/eps).
-        static_joint_friction_range = [0.0, 0.3]
+        static_joint_friction_range = [0.0, 0.6]
         static_joint_friction_nominal = 0.0
         static_joint_friction_max_range = [0.0, 0.6]
         static_friction_eps = 0.05
 
-        observation_noise_range = [0.9, 1.1]
+        observation_noise_range = [0.5, 1.5]
         observation_noise_nominal = 1.0
         observation_noise_max_range = [0.5, 1.5]
 
@@ -79,10 +80,19 @@ class GO2RoughCfg( LeggedRobotCfg ):
             initial_level = 1.0
             max_level = 1.0
             level_step = 0.05
-            update_interval = 50
+            update_interval = 200
             success_threshold = 0.8
-            min_episodes_for_update = 500
+            min_episodes_for_update = 1000
             use_stagewise_progression = False
+            # Optional gate: require UPESI stability before expanding CDR.
+            upesi_gate_enabled = False
+            upesi_gate_metric = "upesi_loss_ident"
+            upesi_gate_ewma_beta = 0.8
+            upesi_gate_delta_max = 0.05
+            upesi_gate_abs_min = 0.0012
+            upesi_gate_ref_multiplier = 1.8
+            upesi_gate_ref_windows = 5
+            upesi_gate_cooldown_windows = 2
   
     class rewards( LeggedRobotCfg.rewards ):
         soft_dof_pos_limit = 0.9
@@ -98,6 +108,7 @@ class GO2RoughCfgPPO( LeggedRobotCfgPPO ):
         embedding_dim = 8
         theta_dim = 14
         alpha_scale = 1.0
+        policy_alpha_input_scale = 1.0
         theta_keys = [
             "added_mass",
             "surface_friction",
@@ -146,7 +157,7 @@ class GO2RoughCfgPPO( LeggedRobotCfgPPO ):
             0.6,
             0.6,
         ]
-        freeze_encoder_after_iter = 2500
+        freeze_encoder_after_iter = 4500
     class runner( LeggedRobotCfgPPO.runner ):
         run_name = ''
         experiment_name = 'rough_go2'

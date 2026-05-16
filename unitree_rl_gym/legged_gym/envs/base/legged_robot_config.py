@@ -94,7 +94,7 @@ class LeggedRobotCfg(BaseConfig):
     class domain_rand:
         randomize_friction = True
         friction_range = [0.5, 1.25]
-        randomize_base_mass = False
+        randomize_base_mass = True
         added_mass_range = [-1., 1.]
         push_robots = True
         push_interval_s = 15
@@ -210,7 +210,7 @@ class LeggedRobotCfgPPO(BaseConfig):
         policy_class_name = 'ActorCritic'
         algorithm_class_name = 'PPO'
         num_steps_per_env = 24 # per iteration
-        max_iterations = 5000 # number of policy updates
+        max_iterations = 10000 # number of policy updates
 
         # logging
         save_interval = 50 # check for potential saves every this many iterations
@@ -226,22 +226,24 @@ class LeggedRobotCfgPPO(BaseConfig):
         enabled = False
         embedding_dim = 8
         alpha_scale = 1.0
+        # Multiplier applied only to policy inputs concat(obs, alpha), not to UPESI internals.
+        policy_alpha_input_scale = 2.0
         theta_dim = 14
         theta_keys = ["added_mass", "friction_coeff"]
         # Global normalization bounds that should cover both nominal DR and full CDR target ranges.
         theta_min = [-3.0, 0.1]
         theta_max = [3.0, 1.5]
-        dynamics_lr = 3.0e-4
+        dynamics_lr = 1.0e-4
         dynamics_batch_size = 4096
         dynamics_updates_per_iter = 2
-        lambda_rec = 0.05
+        lambda_rec = 0.25
         buffer_size = 500000
         predict_delta_obs = True
         # If true, include base linear velocity in dynamics-loss observation subset.
         dynamics_include_base_lin_vel = True
         detach_encoder_for_ppo = True
-        identification_lr = 1.0e-3
-        identification_steps = 300
+        identification_lr = 5.0e-4
+        identification_steps = 500
         # Optional episode length override (seconds) used only in play.py for upesi_eval_mode="identified".
         # None or <=0 keeps the default env episode length.
         identified_eval_episode_length_s = 5.0
@@ -249,20 +251,20 @@ class LeggedRobotCfgPPO(BaseConfig):
         # -1 disables freezing.
         freeze_encoder_after_iter = -1
         # Online identified adaptation (play/eval)
-        online_window_size = 1024
+        online_window_size = 2048
         # Minimum number of valid transitions required to run online identification.
         # If None or <=0 in code, defaults to online_window_size.
-        online_min_buffer_size = 512
-        online_update_interval = 256
-        online_alpha_init = "zero"  # "zero" | "nominal" | "file"
+        online_min_buffer_size = 256
+        online_update_interval = 128
+        online_alpha_init = "nominal"  # "zero" | "nominal" | "file"
         # Path to serialized alpha for online_alpha_init="file" and/or saving final alpha.
         online_alpha_file = ""
         # If false, run fixed-alpha playback in online_identified mode (no online adaptation updates).
-        online_enable_updates = False
-        online_alpha_smoothing_beta = 0.2
-        online_max_alpha_norm = 10.0
+        online_enable_updates = True
+        online_alpha_smoothing_beta = 0.4
+        online_max_alpha_norm = 5.0
         # Accept online alpha update only if identify_loss_ratio < this threshold.
-        online_identify_accept_ratio = 0.997
+        online_identify_accept_ratio = 0.996
         # Multiplier for play.py rollout length in online_identified mode only.
         # 1.0 keeps default length: int(env.max_episode_length) + 1.
         online_eval_rollout_multiplier = 1.0

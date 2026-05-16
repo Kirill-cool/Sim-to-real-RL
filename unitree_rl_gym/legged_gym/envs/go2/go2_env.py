@@ -233,6 +233,7 @@ class Go2Robot(LeggedRobot):
         self.cdr_stage_idx = 0
         self.cdr_metrics_window = deque(maxlen=self.cdr_update_interval)
         self.cdr_iteration_counter = 0
+        self._init_cdr_upesi_gate_state(cdr_cfg)
 
         if self.cdr_enabled:
             self.cdr_level = float(np.clip(initial_level, 0.0, self.cdr_max_level))
@@ -380,6 +381,23 @@ class Go2Robot(LeggedRobot):
         low, high = self.domain_rand_current_ranges[range_key]
         return np.random.uniform(low, high, size=sample_shape).astype(np.float32)
 
+    def _sample_range_per_leg(self, range_key, per_leg_range_key, num_envs, num_legs=4):
+        per_leg_ranges = self.domain_rand_current_ranges.get(per_leg_range_key, None)
+        if not isinstance(per_leg_ranges, dict):
+            return self._sample_range(range_key, (num_envs, num_legs))
+
+        sampled = np.zeros((num_envs, num_legs), dtype=np.float32)
+        for leg_idx, leg_name in enumerate(self.LEG_ORDER[:num_legs]):
+            leg_range = per_leg_ranges.get(leg_name, None)
+            if leg_range is None:
+                low, high = self.domain_rand_current_ranges[range_key]
+            else:
+                low, high = float(leg_range[0]), float(leg_range[1])
+                if low > high:
+                    low, high = high, low
+            sampled[:, leg_idx] = np.random.uniform(low, high, size=num_envs).astype(np.float32)
+        return sampled
+
     def _assert_samples_in_range(self, values, range_key):
         low, high = self.domain_rand_current_ranges[range_key]
         eps = 1.0e-5
@@ -463,9 +481,24 @@ class Go2Robot(LeggedRobot):
         else:
             sampled_added_mass = np.zeros(env_ids_np.size, dtype=np.float32)
 
-        sampled_motor_strength = self._sample_range("motor_strength_range", (env_ids_np.size, 4))
-        sampled_joint_damping = self._sample_range("joint_damping_range", (env_ids_np.size, 4))
-        sampled_static_joint_friction = self._sample_range("static_joint_friction_range", (env_ids_np.size, 4))
+        sampled_motor_strength = self._sample_range_per_leg(
+            "motor_strength_range",
+            "motor_strength_range_per_leg",
+            env_ids_np.size,
+            num_legs=4,
+        )
+        sampled_joint_damping = self._sample_range_per_leg(
+            "joint_damping_range",
+            "joint_damping_range_per_leg",
+            env_ids_np.size,
+            num_legs=4,
+        )
+        sampled_static_joint_friction = self._sample_range_per_leg(
+            "static_joint_friction_range",
+            "static_joint_friction_range_per_leg",
+            env_ids_np.size,
+            num_legs=4,
+        )
         sampled_obs_noise = self._sample_range("observation_noise_range", env_ids_np.size)
         self._assert_samples_in_range(sampled_motor_strength, "motor_strength_range")
         self._assert_samples_in_range(sampled_joint_damping, "joint_damping_range")

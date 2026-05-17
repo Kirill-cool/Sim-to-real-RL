@@ -372,6 +372,13 @@ def _save_online_alpha_to_file(path, alpha, metadata=None):
     torch.save(payload, path)
 
 
+def _resolve_combined_experiment_name(train_cfg):
+    experiment_name = str(getattr(getattr(train_cfg, "runner", None), "experiment_name", "")).strip()
+    if experiment_name == "":
+        experiment_name = "rough_go2_combined"
+    return experiment_name
+
+
 def _resolve_combined_run_name(train_cfg, args):
     candidates = [
         getattr(args, "load_run", None),
@@ -385,7 +392,9 @@ def _resolve_combined_run_name(train_cfg, args):
             continue
         return os.path.basename(candidate_str.rstrip("/"))
 
-    combined_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "rough_go2_combined")
+    combined_root = os.path.join(
+        LEGGED_GYM_ROOT_DIR, "logs", _resolve_combined_experiment_name(train_cfg)
+    )
     try:
         run_dirs = [
             d for d in os.listdir(combined_root)
@@ -419,7 +428,9 @@ def _make_unique_dir(parent_dir, base_name):
 def _create_adapted_export_package(train_cfg, ppo_runner, args, alpha, summary_metrics):
     run_name = _resolve_combined_run_name(train_cfg, args)
     run_name_clean = run_name.rstrip("_")
-    combined_root = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", "rough_go2_combined")
+    combined_root = os.path.join(
+        LEGGED_GYM_ROOT_DIR, "logs", _resolve_combined_experiment_name(train_cfg)
+    )
     adapted_group_dir = os.path.join(combined_root, f"{run_name_clean}_adapted")
     package_dir = _make_unique_dir(adapted_group_dir, f"{run_name_clean}_adapted_model")
 
@@ -697,7 +708,7 @@ def _log_upesi_theta_stats(env, label):
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # Play-only manual heading overrides (edit directly here; no CLI flags required).
-    manual_heading_command = None   # None | True | False
+    manual_heading_command = False   # None | True | False
     manual_heading_target_rad = (0.0)  # None | float (e.g. 0.0)
     # Keep explicit play overrides, but set them equal to task/train config values.
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 100)
@@ -708,9 +719,9 @@ def play(args):
     env_cfg.domain_rand.randomize_friction = env_cfg.domain_rand.randomize_friction
     env_cfg.domain_rand.push_robots = True
     env_cfg.commands.curriculum = env_cfg.commands.curriculum
-    env_cfg.commands.ranges.lin_vel_x = [-1.0, 1.0]
-    env_cfg.commands.ranges.lin_vel_y = [-1.0, 1.0]
-    env_cfg.commands.ranges.ang_vel_yaw = [-1.0, 1.0]
+    env_cfg.commands.ranges.lin_vel_x = [1.0, 1.0]
+    env_cfg.commands.ranges.lin_vel_y = [0.0, 0.0]
+    env_cfg.commands.ranges.ang_vel_yaw = [0.0, 0.0]
 
     if manual_heading_command is not None:
         env_cfg.commands.heading_command = bool(manual_heading_command)

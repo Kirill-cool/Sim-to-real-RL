@@ -71,6 +71,9 @@ class OnPolicyRunner:
         self.upesi_freeze_encoder_after_iter = -1
         self.upesi_obs_dyn_indices = None
         self.upesi_obs_dyn_dim = 0
+        self.upesi_ident_group_name_to_indices = {}
+        self.upesi_ident_group_metric_keys = []
+        self.upesi_ident_per_key_metric_keys = []
 
         if self.upesi_enabled:
             if not hasattr(self.env, "get_current_upesi_theta"):
@@ -92,6 +95,7 @@ class OnPolicyRunner:
                     "UPESI theta configuration mismatch: "
                     f"theta_dim={self.upesi_theta_dim} but len(theta_keys)={len(self.upesi_theta_keys)}"
                 )
+            self._init_upesi_ident_metric_layout()
             self.upesi_theta_min = torch.tensor(
                 self.upesi_cfg.get("theta_min", [-3.0, 0.1]), dtype=torch.float, device=self.device
             ).view(1, -1)
@@ -338,6 +342,90 @@ class OnPolicyRunner:
         if low > high:
             low, high = high, low
         return [low, high]
+
+    def _sanitize_metric_key_component(self, value):
+        return str(value).strip().replace(" ", "_")
+
+    def _init_upesi_ident_metric_layout(self):
+        self.upesi_ident_group_name_to_indices = {}
+        self.upesi_ident_group_metric_keys = []
+        self.upesi_ident_per_key_metric_keys = []
+        if not self.upesi_enabled:
+            return
+
+        for key in self.upesi_theta_keys:
+            key_sanitized = self._sanitize_metric_key_component(key)
+            self.upesi_ident_per_key_metric_keys.append(
+                f"upesi_loss_ident_{key_sanitized}"
+            )
+
+        key_to_idx = {str(key): idx for idx, key in enumerate(self.upesi_theta_keys)}
+        group_rules = {
+            "added_mass": {"added_mass"},
+            "surface_friction": {"surface_friction", "friction_coeff", "friction"},
+        }
+        for group_name, aliases in group_rules.items():
+            indices = [
+                idx for key, idx in key_to_idx.items()
+                if key in aliases
+            ]
+            if len(indices) > 0:
+                self.upesi_ident_group_name_to_indices[group_name] = sorted(indices)
+
+        prefix_groups = {
+            "motor_strength": "motor_strength",
+            "joint_damping": "joint_damping",
+            "static_joint_friction": "static_joint_friction",
+        }
+        for group_name, prefix in prefix_groups.items():
+            indices = [
+                idx for idx, key in enumerate(self.upesi_theta_keys)
+                if str(key).startswith(prefix)
+            ]
+            if len(indices) > 0:
+                self.upesi_ident_group_name_to_indices[group_name] = sorted(indices)
+
+        for group_name in sorted(self.upesi_ident_group_name_to_indices.keys()):
+            self.upesi_ident_group_metric_keys.append(f"upesi_loss_ident_{group_name}")
+
+        missing_groups = []
+        for required_group in (
+            "added_mass",
+            "surface_friction",
+            "motor_strength",
+            "joint_damping",
+            "static_joint_friction",
+        ):
+            if required_group not in self.upesi_ident_group_name_to_indices:
+                missing_groups.append(required_group)
+        if len(missing_groups) > 0:
+            print(
+                "[UPESI] ident group diagnostics: missing groups for current theta_keys: "
+                + ", ".join(missing_groups)
+            )
+
+    def _compute_upesi_ident_diagnostics(self, sq_error):
+        diagnostics = {}
+        if sq_error is None or sq_error.ndim != 2 or sq_error.shape[0] == 0:
+            return diagnostics
+        theta_dim_in_batch = int(sq_error.shape[1])
+
+        for idx, theta_key in enumerate(self.upesi_theta_keys):
+            if idx >= theta_dim_in_batch:
+                break
+            key_sanitized = self._sanitize_metric_key_component(theta_key)
+            diagnostics[f"upesi_loss_ident_{key_sanitized}"] = float(
+                sq_error[:, idx].mean().item()
+            )
+
+        for group_name, indices in self.upesi_ident_group_name_to_indices.items():
+            valid_indices = [int(idx) for idx in indices if 0 <= int(idx) < theta_dim_in_batch]
+            if len(valid_indices) == 0:
+                continue
+            diagnostics[f"upesi_loss_ident_{group_name}"] = float(
+                sq_error[:, valid_indices].mean().item()
+            )
+        return diagnostics
 
     def _get_cdr_max_ranges_by_key(self):
         if hasattr(self.env, "get_upesi_cdr_max_ranges"):
@@ -760,6 +848,7 @@ class OnPolicyRunner:
             loss_total_accum += float(loss_total.item())
 
         loss_ident = None
+        loss_ident_diag = {}
         if self.upesi_identification_optimizer is not None and self.upesi_identification_steps > 0:
             loss_ident_accum = 0.0
             for _ in range(self.upesi_identification_steps):
@@ -772,21 +861,29 @@ class OnPolicyRunner:
                         f"[UPESI] decoder output shape mismatch: {tuple(theta_hat_norm.shape)} "
                         f"vs theta batch {tuple(theta_norm_batch.shape)}"
                     )
-                loss_ident_step = torch.mean((theta_hat_norm - theta_norm_batch) ** 2)
+                sq_error_ident_step = (theta_hat_norm - theta_norm_batch) ** 2
+                loss_ident_step = torch.mean(sq_error_ident_step)
                 self.upesi_identification_optimizer.zero_grad()
                 loss_ident_step.backward()
                 self.upesi_identification_optimizer.step()
                 loss_ident_accum += float(loss_ident_step.item())
+                step_diag = self._compute_upesi_ident_diagnostics(sq_error_ident_step.detach())
+                for metric_key, metric_value in step_diag.items():
+                    loss_ident_diag[metric_key] = loss_ident_diag.get(metric_key, 0.0) + float(metric_value)
             loss_ident = loss_ident_accum / float(self.upesi_identification_steps)
+            for metric_key in list(loss_ident_diag.keys()):
+                loss_ident_diag[metric_key] /= float(self.upesi_identification_steps)
 
         num_updates = max(1, self.upesi_dynamics_updates_per_iter)
-        return {
+        stats = {
             "loss_dyn": loss_dyn_accum / float(num_updates),
             "loss_rec": loss_rec_accum / float(num_updates),
             "loss_total": loss_total_accum / float(num_updates),
             "loss_ident": loss_ident,
             "buffer_size": float(len(self.upesi_buffer)),
         }
+        stats.update(loss_ident_diag)
+        return stats
 
     def _collect_curriculum_metrics(self, ep_infos, iteration):
         metrics = {
@@ -1126,6 +1223,12 @@ class OnPolicyRunner:
             ep_string += f"""{'UPESI loss_total:':>{pad}} {'nan' if loss_total is None else f'{loss_total:.6f}'}\n"""
             if loss_ident is not None:
                 ep_string += f"""{'UPESI loss_ident:':>{pad}} {loss_ident:.6f}\n"""
+                for metric_key in self.upesi_ident_group_metric_keys:
+                    metric_value = upesi_stats.get(metric_key, None)
+                    if metric_value is None:
+                        continue
+                    metric_label = metric_key.replace("upesi_loss_ident_", "UPESI ident ").replace("_", " ")
+                    ep_string += f"""{f'{metric_label}:':>{pad}} {metric_value:.6f}\n"""
         if upesi_scale_stats is not None and self.upesi_enabled:
             ep_string += f"""{'UPESI obs_mean:':>{pad}} {upesi_scale_stats['obs_mean']:.6f}\n"""
             ep_string += f"""{'UPESI obs_std:':>{pad}} {upesi_scale_stats['obs_std']:.6f}\n"""
@@ -1171,6 +1274,20 @@ class OnPolicyRunner:
                 self.writer.add_scalar('upesi/loss_rec', upesi_stats["loss_rec"], locs['it'])
             if upesi_stats.get("loss_total", None) is not None:
                 self.writer.add_scalar('upesi/loss_total', upesi_stats["loss_total"], locs['it'])
+            if upesi_stats.get("loss_ident", None) is not None:
+                self.writer.add_scalar('upesi/loss_ident', upesi_stats["loss_ident"], locs['it'])
+            for metric_key in self.upesi_ident_group_metric_keys:
+                metric_value = upesi_stats.get(metric_key, None)
+                if metric_value is None:
+                    continue
+                metric_name = metric_key.replace("upesi_loss_ident_", "")
+                self.writer.add_scalar(f'upesi_ident_group/{metric_name}', metric_value, locs['it'])
+            for metric_key in self.upesi_ident_per_key_metric_keys:
+                metric_value = upesi_stats.get(metric_key, None)
+                if metric_value is None:
+                    continue
+                metric_name = metric_key.replace("upesi_loss_ident_", "")
+                self.writer.add_scalar(f'upesi_ident_key/{metric_name}', metric_value, locs['it'])
         if upesi_scale_stats is not None and self.upesi_enabled:
             self.writer.add_scalar('UPESI/theta_norm_mean', upesi_scale_stats['theta_norm_mean'], locs['it'])
             self.writer.add_scalar('UPESI/theta_norm_std', upesi_scale_stats['theta_norm_std'], locs['it'])

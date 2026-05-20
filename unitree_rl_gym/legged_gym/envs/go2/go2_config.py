@@ -2,7 +2,7 @@ from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobot
 
 class GO2RoughCfg( LeggedRobotCfg ):
     class init_state( LeggedRobotCfg.init_state ):
-        pos = [0.0, 0.0, 0.42] # x,y,z [m]
+        pos = [0.0, 0.0, 0.36] # x,y,z [m]
         default_joint_angles = { # = target angles [rad] when action = 0.0
             'FL_hip_joint': 0.1,   # [rad]
             'RL_hip_joint': 0.1,   # [rad]
@@ -82,7 +82,7 @@ class GO2RoughCfg( LeggedRobotCfg ):
             level_step = 0.05
             update_interval = 200
             success_threshold = 0.8
-            min_episodes_for_update = 1000
+            min_episodes_for_update = 500
             use_stagewise_progression = False
             # Optional gate: require UPESI stability before expanding CDR.
             upesi_gate_enabled = False

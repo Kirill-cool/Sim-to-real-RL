@@ -1,8 +1,9 @@
 from legged_gym.envs.go2.go2_config import GO2RoughCfg, GO2RoughCfgPPO
+from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
 
 
 class AliengoRoughCfg(GO2RoughCfg):
-    class init_state(GO2RoughCfg.init_state):
+    class init_state(LeggedRobotCfg.init_state):
         pos = [0.0, 0.0, 0.42]  # x, y, z [m]
         default_joint_angles = {
             "FL_hip_joint": -0.0,
@@ -57,7 +58,7 @@ class AliengoRoughCfg(GO2RoughCfg):
         added_mass_nominal = 0.0
         added_mass_max_range = [-1.0, 1.0]
 
-        push_robots = True
+        push_robots = False
         push_interval_s = 15
         max_push_vel_xy = 1.0
         push_vel_xy_nominal = 0.0
@@ -73,15 +74,15 @@ class AliengoRoughCfg(GO2RoughCfg):
         joint_damping_max_range = [0.9, 1.1]
 
     class rewards(GO2RoughCfg.rewards):
-        base_height_target = 0.43
+        base_height_target = 0.41
 
     class commands(GO2RoughCfg.commands):
         heading_command = False
 
         class ranges(GO2RoughCfg.commands.ranges):
-            lin_vel_x = [-1.0, 2.4]
-            lin_vel_y = [-0.3, 0.3]
-            ang_vel_yaw = [-1.57, 1.57]
+            lin_vel_x = [-1.0, 1.0] # min max [m/s]
+            lin_vel_y = [-1.0, 1.0]   # min max [m/s]
+            ang_vel_yaw = [-1, 1]    # min max [rad/s]
             heading = [-3.14, 3.14]
 
 
